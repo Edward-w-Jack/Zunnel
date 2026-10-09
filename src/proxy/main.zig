@@ -1,7 +1,9 @@
 //! zunnel-proxy: runs on the operator machine. Accepts agents, exposes TUN
 //! interfaces routed through them, and manages listeners on the agents.
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("common");
+const privileges = @import("privileges.zig");
 const tun = @import("tun.zig");
 const server_mod = @import("server.zig");
 const Tunnel = @import("tunnel.zig").Tunnel;
@@ -92,6 +94,7 @@ pub fn main() !void {
     const gpa = std.heap.smp_allocator;
     const args = try std.process.argsAlloc(gpa);
     const opts = try parseArgs(gpa, args);
+    if (privileges.check(opts.tun_name)) |problem| fatal("{s}", .{problem});
 
     const static, const created = keys.loadOrCreate(opts.key_file) catch |err|
         fatal("cannot load key file '{s}': {s}", .{ opts.key_file, @errorName(err) });
@@ -110,6 +113,7 @@ pub fn main() !void {
         .max_dials = opts.max_dials,
     };
     var console: Console = .{ .gpa = gpa, .server = &server, .pending_routes = opts.routes };
+    installShutdownHandlers(&server);
     if (opts.autostart) _ = console.ensureTunnel(opts.tun_name) orelse std.process.exit(1);
 
     server.listen() catch |err| fatal("cannot listen on {f}: {s}", .{ opts.listen, @errorName(err) });
@@ -126,6 +130,49 @@ pub fn main() !void {
         if (opts.secret.len > 0) "<secret>" else "",
     });
     console.run();
+}
+
+// ------------------------------------------------------- graceful shutdown
+
+var shutdown_server: ?*Server = null;
+var stop_requested = std.atomic.Value(bool).init(false);
+
+/// Ctrl-C / SIGTERM / closing the console window remove routes, adapters and
+/// firewall rules before exiting.
+fn installShutdownHandlers(server: *Server) void {
+    shutdown_server = server;
+    if (builtin.os.tag == .windows) {
+        // Runs on its own thread, so it may do the full shutdown itself.
+        _ = std.os.windows.kernel32.SetConsoleCtrlHandler(onConsoleCtrl, std.os.windows.TRUE);
+    } else {
+        // Signal handlers may only set a flag; a watcher thread does the work.
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &act, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+        const t = std.Thread.spawn(.{}, shutdownWatcher, .{}) catch return;
+        t.detach();
+    }
+}
+
+fn onConsoleCtrl(_: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
+    std.debug.print("\nshutting down...\n", .{});
+    if (shutdown_server) |s| s.shutdown();
+    std.process.exit(0);
+}
+
+fn onSignal(_: c_int) callconv(.c) void {
+    stop_requested.store(true, .release);
+}
+
+fn shutdownWatcher() void {
+    while (!stop_requested.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
+    std.debug.print("\nshutting down...\n", .{});
+    if (shutdown_server) |s| s.shutdown();
+    std.process.exit(0);
 }
 
 const help_text =
@@ -203,6 +250,7 @@ const Console = struct {
         } else if (eql(cmd, "relay")) {
             self.relay(at(args, 0), at(args, 1));
         } else if (eql(cmd, "exit") or eql(cmd, "quit")) {
+            self.server.shutdown();
             std.process.exit(0);
         } else {
             std.debug.print("unknown command '{s}', try 'help'\n", .{cmd});
@@ -339,10 +387,26 @@ const Console = struct {
     fn route(self: *Console, args: []const []const u8) void {
         if (args.len == 0 or eql(args[0], "list")) return self.listIfaces();
         if (args.len < 2 or !(eql(args[0], "add") or eql(args[0], "del")))
-            return std.debug.print("usage: route add|del <cidr> [iface]\n", .{});
+            return std.debug.print("usage: route add|del <cidr> [iface] [force]\n", .{});
         const net = args[1];
-        if (!tun.validateCidr(net)) return std.debug.print("invalid cidr '{s}'\n", .{net});
-        const name = if (args.len > 2) args[2] else self.server.default_iface;
+        const cidr = tun.Cidr.parse(net) catch return std.debug.print("invalid cidr '{s}'\n", .{net});
+        // Optional trailing words: an interface name and/or "force".
+        var name: []const u8 = self.server.default_iface;
+        var force = false;
+        for (args[2..]) |a| {
+            if (eql(a, "force")) force = true else name = a;
+        }
+        if (eql(args[0], "add") and !force) {
+            var buf: [64]u8 = undefined;
+            self.server.mutex.lock();
+            const covered = self.server.linkCoveredLocked(cidr, &buf);
+            self.server.mutex.unlock();
+            if (covered) |who| return std.debug.print(
+                "refusing: {s} covers {s}; routing it into the tunnel would cut that agent off.\n" ++
+                    "Append 'force' to add it anyway.\n",
+                .{ net, who },
+            );
+        }
         const t = self.server.findTunnel(name) orelse {
             if (eql(args[0], "add") and std.mem.eql(u8, name, self.server.default_iface)) {
                 self.pending_routes.append(self.gpa, self.gpa.dupe(u8, net) catch return) catch {};

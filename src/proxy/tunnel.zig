@@ -163,6 +163,8 @@ pub const Tunnel = struct {
     localhost_net: tun.Cidr,
     /// Console-thread only.
     routes: std.ArrayList([]const u8) = .empty,
+    /// Guards `routes` against readers on other threads (the console is the only writer).
+    routes_mutex: std.Thread.Mutex = .{},
     running: std.atomic.Value(bool) = .init(true),
     reader: ?std.Thread = null,
 
@@ -303,17 +305,34 @@ pub const Tunnel = struct {
     pub fn addRoute(self: *Tunnel, cidr: []const u8) !void {
         for (self.routes.items) |r| if (std.mem.eql(u8, r, cidr)) return;
         try self.dev.addRoute(cidr);
-        try self.routes.append(self.gpa, try self.gpa.dupe(u8, cidr));
+        const copy = try self.gpa.dupe(u8, cidr);
+        self.routes_mutex.lock();
+        defer self.routes_mutex.unlock();
+        try self.routes.append(self.gpa, copy);
     }
 
     pub fn delRoute(self: *Tunnel, cidr: []const u8) !void {
         for (self.routes.items, 0..) |r, i| {
             if (!std.mem.eql(u8, r, cidr)) continue;
             try self.dev.delRoute(cidr);
+            self.routes_mutex.lock();
+            defer self.routes_mutex.unlock();
             self.gpa.free(self.routes.orderedRemove(i));
             return;
         }
         return error.NoSuchRoute;
+    }
+
+    /// Returns the route (copied into `buf`) that contains `ip`, if any. Safe
+    /// from any thread.
+    pub fn routeCovering(self: *Tunnel, ip: [4]u8, buf: []u8) ?[]const u8 {
+        self.routes_mutex.lock();
+        defer self.routes_mutex.unlock();
+        for (self.routes.items) |r| {
+            const net = tun.Cidr.parse(r) catch continue;
+            if (net.contains(ip)) return std.fmt.bufPrint(buf, "{s} on {s}", .{ r, self.name }) catch r;
+        }
+        return null;
     }
 
     fn abortAll(self: *Tunnel) void {

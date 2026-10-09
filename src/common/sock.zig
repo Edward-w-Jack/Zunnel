@@ -235,6 +235,32 @@ pub fn pollRead(h: Handle, timeout_ms: i32) bool {
     return n > 0;
 }
 
+/// Opens a listening TCP socket. On Windows it uses SO_EXCLUSIVEADDRUSE: with
+/// the default (or SO_REUSEADDR) another local process could bind a more
+/// specific address on the same port and silently take over our connections.
+/// Elsewhere SO_REUSEADDR only allows quick restarts over TIME_WAIT.
+pub fn listenTcp(addr: std.net.Address, backlog: u31) !std.net.Server {
+    const h = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    errdefer close(h);
+    const one: i32 = 1;
+    if (is_windows) {
+        const SO_EXCLUSIVEADDRUSE: i32 = ~@as(i32, ws2.SO.REUSEADDR);
+        _ = ws2.setsockopt(h, ws2.SOL.SOCKET, SO_EXCLUSIVEADDRUSE, std.mem.asBytes(&one), @sizeOf(i32));
+    } else {
+        try posix.setsockopt(h, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+    }
+    try posix.bind(h, &addr.any, addr.getOsSockLen());
+    try posix.listen(h, backlog);
+    return .{ .listen_address = localAddress(h) orelse addr, .stream = .{ .handle = h } };
+}
+
+/// True if `ip` is assigned to an interface on this machine.
+pub fn isLocalAddress(ip: [4]u8) bool {
+    const h = udpBind(std.net.Address.initIp4(ip, 0)) catch return false;
+    close(h);
+    return true;
+}
+
 /// Opens a UDP socket bound to `addr`.
 pub fn udpBind(addr: std.net.Address) !Handle {
     const h = try posix.socket(addr.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);

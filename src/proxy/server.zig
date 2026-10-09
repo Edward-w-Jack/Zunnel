@@ -82,11 +82,13 @@ pub const Server = struct {
     handshakes: u32 = 0,
     handshakes_per_ip: std.AutoHashMapUnmanaged([16]u8, u8) = .empty,
 
+    shutting_down: std.atomic.Value(bool) = .init(false),
+
     const max_handshakes = 64;
     const max_handshakes_per_ip = 8;
 
     pub fn listen(self: *Server) !void {
-        const listener = try self.listen_address.listen(.{ .reuse_address = true });
+        const listener = try sock.listenTcp(self.listen_address, 128);
         (try std.Thread.spawn(.{}, acceptLoop, .{ self, listener })).detach();
     }
 
@@ -176,6 +178,8 @@ pub const Server = struct {
         s.parseHello();
 
         var attached: ?*Tunnel = null;
+        var covered_buf: [64]u8 = undefined;
+        var covered: ?[]const u8 = null;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -185,6 +189,13 @@ pub const Server = struct {
                 if (self.relay_ports.fetchRemove(conn.address.getPort())) |kv| s.via = kv.value;
             }
             self.sessions.append(self.gpa, s) catch {};
+            if (conn.address.any.family == std.posix.AF.INET) {
+                const ip = std.mem.asBytes(&conn.address.in.sa.addr).*;
+                for (self.tunnels.items) |t| if (t.routeCovering(ip, &covered_buf)) |r| {
+                    covered = r;
+                    break;
+                };
+            }
             if (self.autostart) {
                 if (self.findTunnelLocked(self.default_iface)) |t| if (t.activeSession() == null) {
                     t.attach(s);
@@ -196,6 +207,7 @@ pub const Server = struct {
         const via = if (s.via) |v| std.fmt.bufPrint(&via_buf, " via agent #{d}", .{v}) catch "" else "";
         std.debug.print("\n[+] agent #{d} joined: {s}@{s} ({s}/{s}) from {f}{s}\n", .{ s.id, s.user, s.hostname, s.os, s.arch, s.remote, via });
         if (attached) |t| std.debug.print("[*] tunnel {s} now routes through agent #{d}\n", .{ t.name, s.id });
+        if (covered) |r| std.debug.print("[!] warning: route {s} covers agent #{d}'s address; its link may break. Remove that route.\n", .{ r, s.id });
 
         while (true) {
             const frame = s.link.recvFrame() catch break;
@@ -318,7 +330,10 @@ pub const Server = struct {
             while (idx < 250) : (idx += 1) {
                 for (self.tunnels.items) |t| {
                     if (t.index == idx) break;
-                } else break :blk idx;
+                } else {
+                    // Skip addresses another program (e.g. a second proxy) already uses.
+                    if (!sock.isLocalAddress(tun.localAddress(idx))) break :blk idx;
+                }
             }
             return error.TooManyTunnels;
         };
@@ -343,6 +358,35 @@ pub const Server = struct {
             return error.NoSuchInterface;
         };
         t.destroy();
+    }
+
+    /// Removes every tunnel (routes, adapters, firewall rules) and disconnects
+    /// all agents. Safe to call more than once and from any thread.
+    pub fn shutdown(self: *Server) void {
+        if (self.shutting_down.swap(true, .acq_rel)) return;
+        var tunnels: std.ArrayList(*Tunnel) = .empty;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            std.mem.swap(std.ArrayList(*Tunnel), &self.tunnels, &tunnels);
+            for (self.sessions.items) |s| s.link.close();
+        }
+        for (tunnels.items) |t| {
+            std.debug.print("removing interface {s}\n", .{t.name});
+            t.destroy();
+        }
+        tunnels.deinit(self.gpa);
+    }
+
+    /// Returns a description of the first session whose link address lies in
+    /// `cidr` (routing it into a tunnel would cut that agent off). Caller holds `mutex`.
+    pub fn linkCoveredLocked(self: *Server, net: tun.Cidr, buf: []u8) ?[]const u8 {
+        for (self.sessions.items) |s| {
+            if (s.remote.any.family != std.posix.AF.INET) continue;
+            const ip = std.mem.asBytes(&s.remote.in.sa.addr).*;
+            if (net.contains(ip)) return std.fmt.bufPrint(buf, "agent #{d}'s link address {d}.{d}.{d}.{d}", .{ s.id, ip[0], ip[1], ip[2], ip[3] }) catch "an agent's link address";
+        }
+        return null;
     }
 
     /// Asks agent `session_id` to open a listener. Returns the listener id.

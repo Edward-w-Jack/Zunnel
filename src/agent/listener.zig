@@ -21,7 +21,7 @@ pub const Listener = struct {
     pub fn start(gpa: std.mem.Allocator, table: *relay.Table, id: u32, bind: proto.Endpoint) !*Listener {
         const addr = proto.endpointAddress(bind);
         const handle = switch (bind.transport) {
-            .tcp => (try addr.listen(.{ .reuse_address = true, .kernel_backlog = 128 })).stream.handle,
+            .tcp => (try sock.listenTcp(addr, 128)).stream.handle,
             .udp => try sock.udpBind(addr),
             _ => return error.UnsupportedTransport,
         };

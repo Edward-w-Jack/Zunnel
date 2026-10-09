@@ -48,7 +48,9 @@ const lwip_cflags = [_][]const u8{
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // `zig build -Drelease` builds ReleaseSafe: both binaries parse untrusted
+    // network input, so keep bounds/overflow checks in release builds.
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
     const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse (optimize != .Debug);
 
     const common = b.createModule(.{
