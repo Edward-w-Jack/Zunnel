@@ -80,20 +80,56 @@ privileges, the agent has these limits:
 
 ```sh
 # operator machine (root, or a pre-created TUN: sudo ip tuntap add user $USER mode tun zunnel)
-zunnel-proxy -secret s3cret -route 10.10.0.0/16 -autostart
+zunnel-proxy -route 10.10.0.0/16 -autostart
 
-# remote host (key printed by the proxy)
-zunnel-agent -connect proxy.example.com:11601 -pubkey <key> -secret s3cret -retry
+# remote host: copy the agent command the proxy prints (it includes the key and secret)
+zunnel-agent -connect proxy.example.com:11601 -pubkey <key> -secret <secret> -retry
 ```
+
+On first run the proxy writes `zunnel.key`, which holds its private key and a generated shared
+secret. The banner prints the full agent command and a matching baked-build command.
 
 Without `-autostart`, use the console (`help` lists everything):
 
 ```
-zunnel> sessions                                   # connected agents
+zunnel> sessions                                   # connected agents, with their IDENT
 zunnel> start 1                                    # route the default iface through agent #1
 zunnel> route add 10.10.0.0/16
 zunnel> ifaces                                     # interfaces, agents, routes, flow counts
 ```
+
+Wherever a command takes an `<agent>`, use its session number or a unique prefix of its IDENT, a
+stable id derived from the agent's host and user.
+
+### Reconnecting agents
+
+`start` binds the interface to the agent's IDENT, and listeners belong to the IDENT too. When an
+agent drops and comes back (`-retry`), its interfaces re-attach and its listeners restart
+automatically, with no console input.
+
+```
+zunnel> bind dmz 36dec464a84b9acc                  # works even while that agent is offline
+zunnel> bindings
+zunnel> unbind dmz                                 # `stop dmz` detaches and unbinds
+```
+
+### Saving the setup
+
+```
+zunnel> save ops.conf                              # interfaces, routes, bindings, listeners
+```
+
+`save` writes the setup as console commands. Start the proxy with `-config ops.conf` to replay it;
+everything bound attaches as soon as its agents connect.
+
+### Agent lifetime
+
+```
+zunnel> kill 36dec4                                # agent shuts down for good, even with -retry
+```
+
+`zunnel-agent -expire 72h` (or `-expire 2026-10-20T18:00Z`) stops the agent for good at that
+point. `sessions` shows the time left.
 
 Several agents at once, each with its own interface:
 
@@ -116,7 +152,7 @@ Pivoting deeper: agent #1 can reach a network where agent #2 runs, but the proxy
 
 ```
 zunnel> relay 1                                    # agent #1 listens on 0.0.0.0:11601
-# on the deeper host:  zunnel-agent -connect <agent-1-ip>:11601 -pubkey <key> -secret s3cret
+# on the deeper host:  zunnel-agent -connect <agent-1-ip>:11601 -pubkey <key> -secret <secret>
 zunnel> sessions                                   # agent #2 shows "via agent #1"
 zunnel> iface add deep
 zunnel> start 2 deep
@@ -137,14 +173,38 @@ agents are disconnected (`-retry` agents reconnect when the proxy comes back).
 | Option | Default | |
 |---|---|---|
 | `-listen <addr:port>` | `0.0.0.0:11601` | where agents connect |
-| `-key <file>` | `zunnel.key` | proxy private key, created if missing |
-| `-secret <s>` | none | shared secret agents must present (recommended) |
+| `-key <file>` | `zunnel.key` | private key and shared secret, created if missing |
+| `-secret <s>` | from key file | override the shared secret agents must present |
+| `-no-secret` | off | accept agents without a secret (warns at startup and on every join) |
+| `-config <file>` | | run console commands from a file at startup (see `save`) |
 | `-tun <name>` | `zunnel` | default interface name |
 | `-route <cidr>` | | route a network through the default interface (repeatable) |
 | `-autostart` | off | create the default interface at startup and attach the first agent |
 | `-localhost-net <cidr>` | `240.0.0.0/4` | destinations here reach the agent's `127.0.0.1` |
 | `-dial-timeout <ms>` | `3000` | how long the agent tries to connect before reporting *filtered* |
 | `-max-dials <n>` | `256` | connects in flight per interface; extra SYNs queue (up to 8192) |
+
+### Agent options
+
+Each setting comes from a flag, then a `ZUNNEL_*` environment variable, then a value baked in at
+build time. An agent built with its settings baked in runs with **no arguments**, so nothing
+sensitive shows up in process listings.
+
+| Flag | Environment | Build option | |
+|---|---|---|---|
+| `-connect <host:port>` | `ZUNNEL_CONNECT` | `-Dagent-connect=` | proxy address |
+| `-pubkey <key>` | `ZUNNEL_PUBKEY` | `-Dagent-pubkey=` | expected proxy key |
+| `-secret <s>` | `ZUNNEL_SECRET` | `-Dagent-secret=` | shared secret |
+| `-expire <when>` | `ZUNNEL_EXPIRE` | `-Dagent-expire=` | stop for good at a UTC time or after a duration |
+| `-id <id>` | `ZUNNEL_ID` | `-Dagent-id=` | override the host-derived IDENT |
+| `-retry` | | `-Dagent-retry=` | reconnect forever (on by default for baked agents) |
+| `-insecure` | | | accept any proxy key and print its fingerprint |
+| `-q` | | | print nothing |
+
+```sh
+zig build -Drelease -Dtarget=x86_64-windows --prefix zig-out/op1 \
+  -Dagent-connect=proxy.example.com:11601 -Dagent-pubkey=<key> -Dagent-secret=<secret> -Dagent-expire=7d
+```
 
 ### Windows notes
 
@@ -204,20 +264,23 @@ translates the result back into packets:
   guard, fuzz tests, graceful shutdown, startup checks
 - [x] P0 VPN-accurate scanning: stray packets dropped, failure-specific answers (RST / silence /
   ICMP unreachable), UDP closed ports, SYN queueing
+- [x] P1 operations (part 1): agent config without arguments (flags > env > baked), stable
+  host-derived agent identity, `kill` and `-expire`, shared secret by default, interface bindings
+  and listeners that survive reconnects, `save` / `-config`
 
 ## Roadmap
 
 ### P1: operations
-- [ ] **Stable agent identity.** A reconnecting agent automatically gets back its interfaces, routes and listeners.
-- [ ] **Agent config without arguments.** Bake in the connect address, key and secret at build
-  time (`-Dconnect=… -Dpubkey=… -Dsecret=…`) or read them from the environment, so secrets don't
-  show up in process listings. Prerequisite for the agent DLL build (P2).
-- [ ] Make `-secret` mandatory by default, and warn loudly when it is disabled.
-- [ ] Agent `ifconfig` (interfaces and addresses in the hello) and `session info <id>`.
+- [x] **Stable agent identity.** A reconnecting agent automatically gets back its interfaces and listeners.
+- [x] **Agent config without arguments.** Flags > `ZUNNEL_*` environment > values baked in at
+  build time (`-Dagent-connect=… -Dagent-pubkey=… -Dagent-secret=…`). Prerequisite for the agent
+  DLL build (P2).
+- [x] Shared secret by default (generated into the key file); `-no-secret` warns loudly.
+- [x] Proxy config file: `save` writes interfaces, routes, bindings and listeners; `-config` restores them.
+- [x] `kill <agent>`, and an optional agent `-expire <time>` for engagement windows.
+- [ ] Agent `ifconfig` (interfaces and addresses) and `session info <id>`.
 - [ ] `flows [iface]` command, plus per-tunnel and per-agent byte and flow counters.
 - [ ] Timestamped logging, `-log <file>`, `-v`/`-q`, and an event log (joins, leaves, routes, listeners).
-- [ ] Proxy config file: interfaces, routes and listeners restored on startup.
-- [ ] `kill <agent>`, and an optional agent `-expire <time>` for engagement windows.
 - [ ] Console line editing, history and tab completion.
 - [ ] Console output that doesn't interleave with the prompt.
 
