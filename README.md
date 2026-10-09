@@ -304,8 +304,8 @@ translates the result back into packets:
 ### P1: operations
 - [x] **Stable agent identity.** A reconnecting agent automatically gets back its interfaces and listeners.
 - [x] **Agent config without arguments.** Flags > `ZUNNEL_*` environment > values baked in at
-  build time (`-Dagent-connect=… -Dagent-pubkey=… -Dagent-secret=…`). Prerequisite for the agent
-  DLL build (P2).
+  build time (`-Dagent-connect=… -Dagent-pubkey=… -Dagent-secret=…`). Also the prerequisite for a
+  possible agent DLL build (see Potential future plans).
 - [x] Shared secret by default (generated into the key file); `-no-secret` warns loudly.
 - [x] Proxy config file: `save` writes interfaces, routes, bindings and listeners; `-config` restores them.
 - [x] `kill <agent>`, and an optional agent `-expire <time>` for engagement windows.
@@ -320,11 +320,6 @@ translates the result back into packets:
   proxies, with auto-detection on Windows.
 - [ ] A less distinctive handshake: no cleartext magic, optional random padding, fixed-size records.
 - [ ] Windows agent built without a console window; optional run-as-service.
-- [ ] **Agent DLL build target** (`zig build -Dagent-dll`) for reflective DLL loading: the agent
-  as a Windows DLL (x86_64 and x86) with an exported entry point that starts the agent on its own
-  thread and returns immediately. A DLL can't take command-line arguments, so it requires the
-  baked-in agent config (P1). It must also be safe to run inside a host process: no console
-  output, no `exit` on errors, and it reconnects (`-retry` behaviour) by default.
 
 ### P3: protocol coverage and scale
 - [ ] IPv6 (lwIP dual stack, IPv6 routes on the TUN).
@@ -333,3 +328,11 @@ translates the result back into packets:
 - [ ] macOS proxy (utun).
 - [ ] In-repo integration lab (`lab.sh` with network namespaces) and CI cross-compiling Linux,
   Windows and macOS.
+
+### Potential future plans
+Ideas that are not scheduled yet.
+- **Agent DLL build target** (`zig build -Dagent-dll`) for reflective DLL loading: the agent
+  as a Windows DLL (x86_64 and x86) with an exported entry point that starts the agent on its own
+  thread and returns immediately. A DLL can't take command-line arguments, so it requires the
+  baked-in agent config (done in P1). It must also be safe to run inside a host process: no
+  console output, no `exit` on errors, and it reconnects (`-retry` behaviour) by default.
