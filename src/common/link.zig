@@ -42,6 +42,9 @@ pub const Link = struct {
     writer: ?std.Thread = null,
     /// When the last record arrived (ms); the writer closes the link when it goes stale.
     last_rx: std.atomic.Value(i64) = .init(0),
+    /// Bytes on the wire (records, including encryption overhead).
+    bytes_tx: std.atomic.Value(u64) = .init(0),
+    bytes_rx: std.atomic.Value(u64) = .init(0),
 
     rx_buf: [max_record]u8 = undefined,
     rx_pos: usize = 0,
@@ -177,6 +180,7 @@ pub const Link = struct {
                     self.close();
                     return;
                 };
+                _ = self.bytes_tx.fetchAdd(2 + ct_len, .monotonic);
                 off = end;
             }
             batch.clearRetainingCapacity();
@@ -204,6 +208,7 @@ pub const Link = struct {
         self.rx_pos = 0;
         self.rx_len = plain_len;
         self.last_rx.store(std.time.milliTimestamp(), .monotonic);
+        _ = self.bytes_rx.fetchAdd(2 + len, .monotonic);
     }
 };
 

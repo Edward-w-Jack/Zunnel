@@ -106,6 +106,10 @@ const Flow = struct {
     shut_tx: bool = false,
     unreported: u32 = 0,
 
+    // --- counters (client -> agent = up, agent -> client = down)
+    bytes_up: u64 = 0,
+    bytes_down: u64 = 0,
+
     // --- UDP
     last_active: i64 = 0,
 };
@@ -147,6 +151,16 @@ const PendingIcmp = struct {
 
 const Outcome = enum { alive, closed, aborted };
 
+/// Per-tunnel totals since the tunnel was created (guarded by netstack.lock).
+pub const Stats = struct {
+    bytes_up: u64 = 0,
+    bytes_down: u64 = 0,
+    flows_opened: u64 = 0,
+    dials_refused: u64 = 0,
+    dials_filtered: u64 = 0,
+    dials_unreachable: u64 = 0,
+};
+
 fn ip4Bytes(a: c.ip4_addr_t) [4]u8 {
     return std.mem.asBytes(&a.addr).*;
 }
@@ -180,6 +194,7 @@ pub const Tunnel = struct {
     dialing: u32 = 0,
     dial_queue: std.ArrayList(u32) = .empty,
     dial_queue_head: usize = 0,
+    stats: Stats = .{},
     tearing_down: bool = false,
 
     pub fn create(gpa: Allocator, if_name: []const u8, index: u8, localhost_net: tun.Cidr) !*Tunnel {
@@ -294,6 +309,43 @@ pub const Tunnel = struct {
         netstack.lock.lock();
         defer netstack.lock.unlock();
         return self.session;
+    }
+
+    pub fn snapshotStats(self: *Tunnel) Stats {
+        netstack.lock.lock();
+        defer netstack.lock.unlock();
+        return self.stats;
+    }
+
+    /// Prints up to `limit` flows (oldest first is not guaranteed).
+    pub fn printFlows(self: *Tunnel, limit: usize) void {
+        netstack.lock.lock();
+        defer netstack.lock.unlock();
+        const now = std.time.milliTimestamp();
+        var shown: usize = 0;
+        var it = self.flows.valueIterator();
+        while (it.next()) |fp| {
+            if (shown == limit) break;
+            const f = fp.*;
+            const t = f.tuple;
+            const age: u64 = @intCast(@max(0, @divTrunc(now - f.created, 1000)));
+            var up_buf: [16]u8 = undefined;
+            var down_buf: [16]u8 = undefined;
+            var dst_buf: [24]u8 = undefined;
+            const dst = std.fmt.bufPrint(&dst_buf, "{d}.{d}.{d}.{d}:{d}", .{ t.dst[0], t.dst[1], t.dst[2], t.dst[3], t.dport }) catch "?";
+            std.debug.print("  {s} {d}.{d}.{d}.{d}:{d:<5} -> {s:<21} {s:<8} {d:>5}s  up {s:>9}  down {s:>9}\n", .{
+                if (t.proto == packet.proto_udp) "udp" else "tcp",
+                t.src[0], t.src[1], t.src[2], t.src[3], t.sport,
+                dst,
+                @tagName(f.state),
+                age,
+                fmtBytes(&up_buf, f.bytes_up),
+                fmtBytes(&down_buf, f.bytes_down),
+            });
+            shown += 1;
+        }
+        if (self.flows.count() > shown) std.debug.print("  ... {d} more\n", .{self.flows.count() - shown});
+        if (self.flows.count() == 0) std.debug.print("  no active flows\n", .{});
     }
 
     pub fn flowCount(self: *Tunnel) usize {
@@ -461,6 +513,7 @@ pub const Tunnel = struct {
         try self.by_tuple.ensureUnusedCapacity(self.gpa, 1);
         self.flows.putAssumeCapacity(flow.id, flow);
         self.by_tuple.putAssumeCapacity(t, flow);
+        self.stats.flows_opened += 1;
         return flow;
     }
 
@@ -559,6 +612,8 @@ pub const Tunnel = struct {
         };
         flow.last_active = std.time.milliTimestamp();
         session.link.sendDroppable(.data, flow.id, dgram.data) catch {};
+        flow.bytes_up += dgram.data.len;
+        self.stats.bytes_up += dgram.data.len;
     }
 
     fn onIcmp(self: *Tunnel, ip: packet.Ip4, pkt: []const u8) void {
@@ -618,6 +673,11 @@ pub const Tunnel = struct {
                     return true;
                 }
                 const verdict = Verdict.fromReason(reason);
+                switch (verdict) {
+                    .refused => self.stats.dials_refused += 1,
+                    .timeout => self.stats.dials_filtered += 1,
+                    else => self.stats.dials_unreachable += 1,
+                }
                 self.answerFailure(flow.tuple, flow.syn_seq, verdict, flow.syn orelse &.{});
                 self.remember(flow.tuple, verdict);
                 self.destroyFlow(flow);
@@ -661,6 +721,8 @@ pub const Tunnel = struct {
                 const t = flow.tuple;
                 const pkt = packet.buildUdp4(&buf, t.dst, t.dport, t.src, t.sport, frame.payload) orelse return;
                 self.dev.write(pkt);
+                flow.bytes_down += frame.payload.len;
+                self.stats.bytes_down += frame.payload.len;
             },
             .icmp_unreachable => {
                 // The target answered with ICMP unreachable (closed UDP port):
@@ -684,6 +746,8 @@ pub const Tunnel = struct {
             const n: u16 = @intCast(@min(flow.from_client.len(), flow.credit, proto.max_payload));
             link.send(.data, flow.id, flow.from_client.slice()[0..n]) catch {};
             flow.from_client.consume(n);
+            flow.bytes_up += n;
+            self.stats.bytes_up += n;
             flow.credit -= n;
             if (flow.pcb) |pcb| c.tcp_recved(pcb, n);
         }
@@ -703,6 +767,8 @@ pub const Tunnel = struct {
             if (n == 0) break;
             if (c.tcp_write(pcb, flow.to_client.slice().ptr, @intCast(n), c.TCP_WRITE_FLAG_COPY) != lwip.ERR_OK) break;
             flow.to_client.consume(n);
+            flow.bytes_down += n;
+            self.stats.bytes_down += n;
             flow.unreported += @intCast(n);
             wrote = true;
         }
@@ -767,6 +833,25 @@ pub const Tunnel = struct {
         self.gpa.destroy(flow);
     }
 };
+
+/// Human-readable byte count, e.g. "12.3 MB".
+pub fn fmtBytes(buf: []u8, n: u64) []const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var v: f64 = @floatFromInt(n);
+    var u: usize = 0;
+    while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
+    return if (u == 0)
+        std.fmt.bufPrint(buf, "{d} B", .{n}) catch "?"
+    else
+        std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[u] }) catch "?";
+}
+
+test fmtBytes {
+    var b: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("512 B", fmtBytes(&b, 512));
+    try std.testing.expectEqualStrings("1.5 KB", fmtBytes(&b, 1536));
+    try std.testing.expectEqualStrings("50.0 MB", fmtBytes(&b, 50 * 1024 * 1024));
+}
 
 fn detachPcb(pcb: *c.struct_tcp_pcb) void {
     c.tcp_arg(pcb, null);

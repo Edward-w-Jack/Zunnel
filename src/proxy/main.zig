@@ -4,16 +4,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common");
 const privileges = @import("privileges.zig");
+const ui = @import("ui.zig");
 const tun = @import("tun.zig");
 const server_mod = @import("server.zig");
-const Tunnel = @import("tunnel.zig").Tunnel;
+const tunnel_mod = @import("tunnel.zig");
+const Tunnel = tunnel_mod.Tunnel;
 
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const keys = common.keys;
 const Allocator = std.mem.Allocator;
 
-pub const std_options: std.Options = .{ .log_level = .info };
+// Everything is compiled in; ui.level filters at runtime (-v / -q).
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = ui.logFn };
 
 const usage =
     \\usage: zunnel-proxy [options]
@@ -23,6 +26,8 @@ const usage =
     \\  -secret <secret>     override the shared secret stored in the key file
     \\  -no-secret           accept agents without a secret (not recommended)
     \\  -config <file>       run the console commands in <file> at startup (see `save`)
+    \\  -log <file>          append timestamped events and log lines to <file>
+    \\  -v / -q              verbose (debug) / quiet (warnings and events only)
     \\  -tun <name>          default TUN interface name (default zunnel)
     \\  -route <cidr>        route a network through the default interface (repeatable)
     \\  -autostart           create the default interface at startup and attach the first agent
@@ -39,6 +44,7 @@ const Options = struct {
     secret: ?[]const u8 = null,
     no_secret: bool = false,
     config_file: ?[]const u8 = null,
+    log_file: ?[]const u8 = null,
     tun_name: []const u8 = "zunnel",
     localhost_net: tun.Cidr = tun.Cidr.parse("240.0.0.0/4") catch unreachable,
     routes: std.ArrayList([]const u8) = .empty,
@@ -65,6 +71,14 @@ fn parseArgs(gpa: Allocator, args: []const [:0]u8) !Options {
             o.no_secret = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "v")) {
+            ui.level = .debug;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "q")) {
+            ui.level = .warn;
+            continue;
+        }
         if (std.mem.eql(u8, a, "h") or std.mem.eql(u8, a, "help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -80,6 +94,8 @@ fn parseArgs(gpa: Allocator, args: []const [:0]u8) !Options {
             o.secret = v;
         } else if (std.mem.eql(u8, a, "config")) {
             o.config_file = v;
+        } else if (std.mem.eql(u8, a, "log")) {
+            o.log_file = v;
         } else if (std.mem.eql(u8, a, "localhost-net")) {
             o.localhost_net = tun.Cidr.parse(v) catch fatal("invalid -localhost-net '{s}'", .{v});
         } else if (std.mem.eql(u8, a, "dial-timeout")) {
@@ -105,6 +121,7 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(gpa);
     const opts = try parseArgs(gpa, args);
     if (privileges.check(opts.tun_name)) |problem| fatal("{s}", .{problem});
+    if (opts.log_file) |path| ui.openLog(path) catch |err| fatal("cannot open log file '{s}': {s}", .{ path, @errorName(err) });
 
     const ident = keys.loadOrCreate(opts.key_file) catch |err|
         fatal("cannot load key file '{s}': {s}", .{ opts.key_file, @errorName(err) });
@@ -217,6 +234,9 @@ const help_text =
     \\  listeners                                  list listeners
     \\  relay <agent> [bind]                       let deeper agents connect through
     \\                                             <agent> (default bind 0.0.0.0:11601)
+    \\  flows [iface] [n]                          active connections with byte counts (n=50)
+    \\  ifconfig [agent]                           the agent's interfaces, with suggested routes
+    \\  session info [agent]                       details about an agent
     \\  kill <agent>                               shut an agent down for good (no reconnect)
     \\  save [file]                                write interfaces, routes, bindings and
     \\                                             listeners as commands (for -config)
@@ -284,6 +304,13 @@ const Console = struct {
             self.relay(at(args, 0), at(args, 1));
         } else if (eql(cmd, "kill")) {
             self.kill(at(args, 0));
+        } else if (eql(cmd, "flows")) {
+            self.flows(args);
+        } else if (eql(cmd, "ifconfig")) {
+            self.ifconfig(at(args, 0));
+        } else if (eql(cmd, "session")) {
+            if (args.len < 1 or !eql(args[0], "info")) return std.debug.print("usage: session info [agent]\n", .{});
+            self.sessionInfo(at(args, 1));
         } else if (eql(cmd, "bind")) {
             self.bindCmd(args);
         } else if (eql(cmd, "unbind")) {
@@ -359,6 +386,59 @@ const Console = struct {
         return sessions[0];
     }
 
+    /// `flows [iface] [n]`: active connections with their byte counts.
+    fn flows(self: *Console, args: []const []const u8) void {
+        var name: ?[]const u8 = null;
+        var limit: usize = 50;
+        for (args) |a| {
+            if (std.fmt.parseInt(usize, a, 10)) |n| limit = n else |_| name = a;
+        }
+        self.server.mutex.lock();
+        defer self.server.mutex.unlock();
+        var any = false;
+        for (self.server.tunnels.items) |t| {
+            if (name) |n| if (!eql(n, t.name)) continue;
+            any = true;
+            std.debug.print("{s}:\n", .{t.name});
+            t.printFlows(limit);
+        }
+        if (!any) std.debug.print("{s}\n", .{if (name != null) "no such interface" else "no tunnel interfaces"});
+    }
+
+    /// Asks an agent for its interfaces; the answer is printed when it arrives.
+    fn ifconfig(self: *Console, agent_arg: ?[]const u8) void {
+        self.server.mutex.lock();
+        defer self.server.mutex.unlock();
+        const s = self.resolveAgentLocked(agent_arg) orelse return;
+        s.link.send(.info_request, 1, &.{}) catch return std.debug.print("agent #{d} is disconnecting\n", .{s.id});
+    }
+
+    fn sessionInfo(self: *Console, agent_arg: ?[]const u8) void {
+        const server = self.server;
+        server.mutex.lock();
+        defer server.mutex.unlock();
+        const s = self.resolveAgentLocked(agent_arg) orelse return;
+        const now = std.time.milliTimestamp();
+        const up: u64 = @intCast(@max(0, @divTrunc(now - s.joined_ms, 1000)));
+        std.debug.print("agent #{d}\n  ident     {s}\n  user      {s}\n  host      {s}\n  os/arch   {s}/{s}\n  pid       {s}\n  version   {s}\n", .{
+            s.id, s.ident, s.user, s.hostname, s.os, s.arch, s.pid, s.version,
+        });
+        if (s.via) |v| {
+            std.debug.print("  remote    via agent #{d}\n", .{v});
+        } else std.debug.print("  remote    {f}\n", .{s.remote});
+        std.debug.print("  connected {d}h{d:0>2}m{d:0>2}s ago\n", .{ up / 3600, up % 3600 / 60, up % 60 });
+        if (s.expire_ms) |deadline| {
+            const left: u64 = @intCast(@max(0, @divTrunc(deadline - now, 1000)));
+            std.debug.print("  expires   in {d}h{d:0>2}m{d:0>2}s\n", .{ left / 3600, left % 3600 / 60, left % 60 });
+        }
+        std.debug.print("  link      {d} bytes sent, {d} received\n", .{ s.link.bytes_tx.load(.monotonic), s.link.bytes_rx.load(.monotonic) });
+        for (server.tunnels.items) |t| if (t.activeSession() == s) std.debug.print("  tunnel    {s}\n", .{t.name});
+        for (server.bindings.items) |b| if (std.mem.eql(u8, b.ident, s.ident)) std.debug.print("  bound     {s}\n", .{b.iface});
+        for (server.listeners.items) |l| if (l.session == s) std.debug.print("  listener  #{d} {s} {f} -> {f}{s}\n", .{
+            l.id, @tagName(l.transport), l.bind, l.target, if (l.active) "" else " (pending)",
+        });
+    }
+
     /// Tells an agent to shut down for good; it will not reconnect.
     fn kill(self: *Console, agent_arg: ?[]const u8) void {
         const arg = agent_arg orelse return std.debug.print("usage: kill <agent>\n", .{});
@@ -366,7 +446,7 @@ const Console = struct {
         defer self.server.mutex.unlock();
         const s = self.resolveAgentLocked(arg) orelse return;
         s.link.send(.kill, 0, &.{}) catch return std.debug.print("agent #{d} is already disconnecting\n", .{s.id});
-        std.debug.print("sent kill to agent #{d} ({s}@{s}); it will not reconnect\n", .{ s.id, s.user, s.hostname });
+        ui.event("sent kill to agent #{d} ({s}@{s}); it will not reconnect", .{ s.id, s.user, s.hostname });
     }
 
     // ------------------------------------------------------------ tunnels
@@ -381,7 +461,7 @@ const Console = struct {
             std.debug.print("cannot create tunnel interface '{s}': {s}\n", .{ name, @errorName(err) });
             return null;
         };
-        std.debug.print("created tunnel interface {s}\n", .{name});
+        ui.event("created tunnel interface {s}", .{name});
         if (std.mem.eql(u8, name, self.server.default_iface)) {
             for (self.pending_routes.items) |r| addRoute(t, r);
             self.pending_routes.clearRetainingCapacity();
@@ -404,7 +484,7 @@ const Console = struct {
         if (t.activeSession()) |prev| if (prev != s) std.debug.print("note: {s} was routed through agent #{d}\n", .{ name, prev.id });
         t.attach(s);
         self.server.setBindingLocked(name, s.ident) catch {};
-        std.debug.print("tunnel {s} now routes through agent #{d} ({s}@{s}); re-attaches when it reconnects\n", .{ name, s.id, s.user, s.hostname });
+        ui.event("tunnel {s} now routes through agent #{d} ({s}@{s}); re-attaches when it reconnects", .{ name, s.id, s.user, s.hostname });
     }
 
     fn stop(self: *Console, name: []const u8) void {
@@ -414,9 +494,9 @@ const Console = struct {
         const unbound = self.server.removeBindingLocked(name);
         if (t.activeSession()) |s| {
             _ = t.detach(s);
-            std.debug.print("{s} stopped\n", .{name});
+            ui.event("{s} stopped", .{name});
         } else if (unbound) {
-            std.debug.print("{s} unbound\n", .{name});
+            ui.event("{s} unbound", .{name});
         } else std.debug.print("{s} has no agent\n", .{name});
     }
 
@@ -471,10 +551,10 @@ const Console = struct {
         const ident = self.resolveIdentLocked(args[1], &buf) orelse return;
         self.server.setBindingLocked(args[0], ident) catch |err| return std.debug.print("bind failed: {s}\n", .{@errorName(err)});
         if (self.server.attachBoundLocked(args[0], ident)) |s| {
-            std.debug.print("{s} bound to {s}; now routes through agent #{d}\n", .{ args[0], ident, s.id });
+            ui.event("{s} bound to {s}; now routes through agent #{d}", .{ args[0], ident, s.id });
         } else if (self.server.findTunnelLocked(args[0]) == null) {
-            std.debug.print("{s} bound to {s} (create it with 'iface add {s}')\n", .{ args[0], ident, args[0] });
-        } else std.debug.print("{s} bound to {s}; attaches when that agent connects\n", .{ args[0], ident });
+            ui.event("{s} bound to {s} (create it with 'iface add {s}')", .{ args[0], ident, args[0] });
+        } else ui.event("{s} bound to {s}; attaches when that agent connects", .{ args[0], ident });
     }
 
     fn unbind(self: *Console, iface_arg: ?[]const u8) void {
@@ -482,7 +562,7 @@ const Console = struct {
         self.server.mutex.lock();
         defer self.server.mutex.unlock();
         if (self.server.removeBindingLocked(name)) {
-            std.debug.print("{s} unbound (still attached until 'stop {s}')\n", .{ name, name });
+            ui.event("{s} unbound (still attached until 'stop {s}')", .{ name, name });
         } else std.debug.print("{s} has no binding\n", .{name});
     }
 
@@ -496,6 +576,13 @@ const Console = struct {
                 std.debug.print("  {s:<12} agent #{d} ({s}@{s}), {d} flows\n", .{ t.name, s.id, s.user, s.hostname, t.flowCount() });
             } else std.debug.print("  {s:<12} idle\n", .{t.name});
             for (t.routes.items) |r| std.debug.print("      route {s}\n", .{r});
+            const st = t.snapshotStats();
+            var up: [16]u8 = undefined;
+            var down: [16]u8 = undefined;
+            std.debug.print("      {d} flows opened, up {s}, down {s}; dials refused {d}, filtered {d}, unreachable {d}\n", .{
+                st.flows_opened,  tunnel_mod.fmtBytes(&up, st.bytes_up), tunnel_mod.fmtBytes(&down, st.bytes_down),
+                st.dials_refused, st.dials_filtered,                     st.dials_unreachable,
+            });
         }
         for (self.pending_routes.items) |r| std.debug.print("  (pending for {s}) route {s}\n", .{ server.default_iface, r });
     }
@@ -514,7 +601,7 @@ const Console = struct {
             self.server.mutex.lock();
             _ = self.server.removeBindingLocked(args[1]);
             self.server.mutex.unlock();
-            std.debug.print("deleted {s}\n", .{args[1]});
+            ui.event("deleted {s}", .{args[1]});
         } else std.debug.print(usage_line, .{});
     }
 
@@ -522,7 +609,7 @@ const Console = struct {
 
     fn addRoute(t: *Tunnel, cidr: []const u8) void {
         t.addRoute(cidr) catch |err| return std.debug.print("route add {s} failed: {s}\n", .{ cidr, @errorName(err) });
-        std.debug.print("routing {s} via {s}\n", .{ cidr, t.name });
+        ui.event("routing {s} via {s}", .{ cidr, t.name });
     }
 
     fn route(self: *Console, args: []const []const u8) void {
@@ -559,7 +646,7 @@ const Console = struct {
             addRoute(t, net);
         } else {
             t.delRoute(net) catch |err| return std.debug.print("route del failed: {s}\n", .{@errorName(err)});
-            std.debug.print("removed {s} from {s}\n", .{ net, name });
+            ui.event("removed {s} from {s}", .{ net, name });
         }
     }
 
@@ -571,7 +658,7 @@ const Console = struct {
             if (args.len < 2) return std.debug.print("usage: listener del <id>\n", .{});
             const id = std.fmt.parseInt(u32, std.mem.trimLeft(u8, args[1], "#"), 10) catch return std.debug.print("invalid id\n", .{});
             self.server.deleteListener(id) catch |err| return std.debug.print("listener del failed: {s}\n", .{@errorName(err)});
-            return std.debug.print("listener #{d} removed\n", .{id});
+            return ui.event("listener #{d} removed", .{id});
         }
         if (!eql(args[0], "add") or args.len < 5)
             return std.debug.print("usage: listener add <agent> <tcp|udp> <bind addr:port> <target addr:port>\n", .{});
@@ -594,8 +681,8 @@ const Console = struct {
             return false;
         };
         if (added.started_on) |sid| {
-            std.debug.print("listener #{d} requested on agent #{d}\n", .{ added.id, sid });
-        } else std.debug.print("listener #{d} registered; starts when agent {s} connects\n", .{ added.id, ident });
+            ui.event("listener #{d} requested on agent #{d}", .{ added.id, sid });
+        } else ui.event("listener #{d} registered; starts when agent {s} connects", .{ added.id, ident });
         return true;
     }
 

@@ -9,8 +9,12 @@ const builtin = @import("builtin");
 const agent = @import("agent.zig");
 const config = @import("config.zig");
 const baked = @import("agent_options");
+const common = @import("common");
 
-pub const std_options: std.Options = .{ .logFn = logFn };
+// Everything is compiled in; `log_level` filters at runtime (-v).
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = logFn };
+
+var log_level: std.log.Level = .info;
 
 fn logFn(
     comptime level: std.log.Level,
@@ -18,8 +22,9 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (agent.quiet) return;
-    std.log.defaultLog(level, scope, format, args);
+    if (agent.quiet or @intFromEnum(level) > @intFromEnum(log_level)) return;
+    var buf: [1024]u8 = undefined;
+    std.debug.print("{s}", .{common.logfmt.line(&buf, level, scope, format, args)});
 }
 
 const usage =
@@ -34,6 +39,7 @@ const usage =
     \\                        or after a duration (90m, 72h, 7d)  (env ZUNNEL_EXPIRE)
     \\  -id <id>              override the host-derived agent id  (env ZUNNEL_ID)
     \\  -q                    quiet: print nothing
+    \\  -v                    verbose: also log each failed dial and port-unreachable
     \\
     \\Settings may also be baked in at build time, e.g.
     \\  zig build -Drelease -Dagent-connect=proxy:11601 -Dagent-pubkey=<key> -Dagent-secret=<secret>
@@ -74,6 +80,8 @@ fn argLayer(args: []const [:0]u8) config.Layer {
             l.retry = true;
         } else if (std.mem.eql(u8, a, "q")) {
             agent.quiet = true;
+        } else if (std.mem.eql(u8, a, "v")) {
+            log_level = .debug;
         } else if (std.mem.eql(u8, a, "h") or std.mem.eql(u8, a, "help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -139,4 +147,5 @@ pub fn main() !void {
 test {
     _ = config;
     _ = @import("identity.zig");
+    _ = @import("netinfo.zig");
 }

@@ -5,6 +5,7 @@ const common = @import("common");
 const netstack = @import("netstack.zig");
 const tun = @import("tun.zig");
 const Tunnel = @import("tunnel.zig").Tunnel;
+const ui = @import("ui.zig");
 
 const Allocator = std.mem.Allocator;
 const Link = common.Link;
@@ -29,6 +30,8 @@ pub const Session = struct {
     pid: []const u8 = "?",
     /// Agent's self-destruct deadline (Unix ms), if it has one.
     expire_ms: ?i64 = null,
+    /// When this session was established (Unix ms).
+    joined_ms: i64 = 0,
     /// Upstream agent this session was relayed through (see `relay` command).
     via: ?u32 = null,
     /// Flows accepted by this agent's listeners, dialed on the proxy side.
@@ -197,6 +200,7 @@ pub const Server = struct {
             .remote = conn.address,
             .hello = self.gpa.dupe(u8, hs.hello) catch &.{},
             .relay = .init(self.gpa, hs.link),
+            .joined_ms = std.time.milliTimestamp(),
         };
         s.relay.on_dialed = .{ .ctx = s, .func = onRelayDialed };
         s.parseHello();
@@ -242,11 +246,11 @@ pub const Server = struct {
         }
         var via_buf: [32]u8 = undefined;
         const via = if (s.via) |v| std.fmt.bufPrint(&via_buf, " via agent #{d}", .{v}) catch "" else "";
-        std.debug.print("\n[+] agent #{d} joined: {s}@{s} ({s}/{s}) id {s} from {f}{s}\n", .{ s.id, s.user, s.hostname, s.os, s.arch, s.ident, s.remote, via });
-        for (attached.items) |name| std.debug.print("[*] tunnel {s} now routes through agent #{d}\n", .{ name, s.id });
-        if (restarted > 0) std.debug.print("[*] restarting {d} listener(s) on agent #{d}\n", .{ restarted, s.id });
-        if (self.no_secret) std.debug.print("[!] warning: running with -no-secret; anyone with the public key can join\n", .{});
-        if (covered) |r| std.debug.print("[!] warning: route {s} covers agent #{d}'s address; its link may break. Remove that route.\n", .{ r, s.id });
+        ui.event("[+] agent #{d} joined: {s}@{s} ({s}/{s}) id {s} from {f}{s}", .{ s.id, s.user, s.hostname, s.os, s.arch, s.ident, s.remote, via });
+        for (attached.items) |name| ui.event("[*] tunnel {s} now routes through agent #{d}", .{ name, s.id });
+        if (restarted > 0) ui.event("[*] restarting {d} listener(s) on agent #{d}", .{ restarted, s.id });
+        if (self.no_secret) ui.event("[!] warning: running with -no-secret; anyone with the public key can join", .{});
+        if (covered) |r| ui.event("[!] warning: route {s} covers agent #{d}'s address; its link may break. Remove that route.", .{ r, s.id });
 
         while (true) {
             const frame = s.link.recvFrame() catch break;
@@ -270,9 +274,9 @@ pub const Server = struct {
                 l.session = null;
                 l.active = false;
             };
-            for (stopped.items) |name| std.debug.print("\n[!] tunnel {s} stopped: its agent disconnected (re-attaches when it reconnects)\n", .{name});
+            for (stopped.items) |name| ui.event("[!] tunnel {s} stopped: its agent disconnected (re-attaches when it reconnects)", .{name});
         }
-        std.debug.print("\n[-] agent #{d} ({s}@{s}) left\n", .{ s.id, s.user, s.hostname });
+        ui.event("[-] agent #{d} ({s}@{s}) left", .{ s.id, s.user, s.hostname });
 
         s.relay.shutdown();
         s.link.destroy();
@@ -285,6 +289,7 @@ pub const Server = struct {
             .ping => s.link.send(.pong, frame.id, frame.payload) catch {},
             .pong => {},
             .listener_ok, .listener_fail => self.onListenerReply(s, frame),
+            .info_reply => self.onInfoReply(s, frame.payload),
             .accepted => self.onAccepted(s, frame),
             else => {
                 if (frame.id & proto.agent_id_bit != 0) {
@@ -309,15 +314,70 @@ pub const Server = struct {
             if (l.id != frame.id or l.session != s) continue;
             if (frame.type == .listener_ok) {
                 l.active = true;
-                std.debug.print("\n[*] listener #{d} active: agent #{d} {s} {f} -> {f}\n", .{ l.id, s.id, @tagName(l.transport), l.bind, l.target });
+                ui.event("[*] listener #{d} active: agent #{d} {s} {f} -> {f}", .{ l.id, s.id, @tagName(l.transport), l.bind, l.target });
             } else {
                 // Keep the record: it is retried the next time the agent connects.
-                std.debug.print("\n[!] listener #{d} failed on agent #{d}: {s} (retried on reconnect; 'listener del {d}' removes it)\n", .{ l.id, s.id, frame.payload, l.id });
+                ui.event("[!] listener #{d} failed on agent #{d}: {s} (retried on reconnect; 'listener del {d}' removes it)", .{ l.id, s.id, frame.payload, l.id });
                 l.session = null;
                 l.active = false;
             }
             return;
         }
+    }
+
+    /// Prints an agent's `ifconfig` answer, with routes the operator may want.
+    fn onInfoReply(self: *Server, s: *Session, text: []const u8) void {
+        var iface_buf: [32]u8 = undefined;
+        const iface = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.tunnels.items) |t| if (t.activeSession() == s) {
+                const n = @min(t.name.len, iface_buf.len);
+                @memcpy(iface_buf[0..n], t.name[0..n]);
+                break :blk iface_buf[0..n];
+            };
+            break :blk "<iface>";
+        };
+        const uplink: ?[4]u8 = if (s.remote.any.family == std.posix.AF.INET) std.mem.asBytes(&s.remote.in.sa.addr).* else null;
+
+        std.debug.print("\n[*] agent #{d} ({s}@{s}) interfaces:\n", .{ s.id, s.user, s.hostname });
+        var suggestions: std.ArrayList(u8) = .empty;
+        defer suggestions.deinit(self.gpa);
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = line[0..eq];
+            const value = line[eq + 1 ..];
+            if (std.mem.eql(u8, key, "gateway")) {
+                std.debug.print("      default gateway {s}\n", .{value});
+                continue;
+            }
+            if (!std.mem.eql(u8, key, "iface")) {
+                std.debug.print("      {s}\n", .{line});
+                continue;
+            }
+            // "iface=<name with spaces> <addr>/<len> ..." - addresses contain '/'.
+            var first_addr = value.len;
+            var toks = std.mem.tokenizeScalar(u8, value, ' ');
+            while (toks.next()) |tok| if (std.mem.indexOfScalar(u8, tok, '/') != null) {
+                first_addr = @intFromPtr(tok.ptr) - @intFromPtr(value.ptr);
+                break;
+            };
+            const name = std.mem.trim(u8, value[0..first_addr], " ");
+            std.debug.print("  {s}\n", .{name});
+            var addrs = std.mem.tokenizeScalar(u8, value[first_addr..], ' ');
+            while (addrs.next()) |a| {
+                std.debug.print("      {s}\n", .{a});
+                const net = tun.Cidr.parse(a) catch continue; // IPv6 addresses are skipped here
+                const ip = std.mem.toBytes(std.mem.nativeToBig(u32, net.net));
+                if (net.mask == 0xffffffff or ip[0] == 127 or (ip[0] == 169 and ip[1] == 254)) continue;
+                const is_uplink = if (uplink) |u| net.contains(u) else false;
+                if (is_uplink) {
+                    suggestions.print(self.gpa, "      {f}  (agent's link to the proxy; don't route)\n", .{net}) catch {};
+                } else suggestions.print(self.gpa, "      route add {f} {s}\n", .{ net, iface }) catch {};
+            }
+        }
+        if (suggestions.items.len > 0) std.debug.print("  networks this agent can reach:\n{s}", .{suggestions.items});
     }
 
     fn onAccepted(self: *Server, s: *Session, frame: common.link.Frame) void {
@@ -414,7 +474,7 @@ pub const Server = struct {
             for (self.sessions.items) |s| s.link.close();
         }
         for (tunnels.items) |t| {
-            std.debug.print("removing interface {s}\n", .{t.name});
+            ui.event("removing interface {s}", .{t.name});
             t.destroy();
         }
         tunnels.deinit(self.gpa);

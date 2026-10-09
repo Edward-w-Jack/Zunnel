@@ -13,6 +13,7 @@ const relay = common.relay;
 const Link = common.Link;
 const Listener = @import("listener.zig").Listener;
 const icmp = @import("icmp.zig");
+const netinfo = @import("netinfo.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
@@ -207,6 +208,7 @@ const Session = struct {
             .icmp_echo => self.icmpEcho(frame.id, frame.payload),
             .listener_add => self.addListener(frame.id, frame.payload),
             .listener_del => if (self.listeners.fetchRemove(frame.id)) |kv| kv.value.stop(),
+            .info_request => self.sendInfo(frame.id),
             .kill => {
                 log.info("killed by the proxy", .{});
                 self.end = .killed;
@@ -214,6 +216,20 @@ const Session = struct {
             },
             else => _ = self.table.dispatch(frame),
         }
+    }
+
+    /// Answers the proxy's `ifconfig` with this host's interfaces.
+    fn sendInfo(self: *Session, id: u32) void {
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        netinfo.write(self.gpa, &out.writer) catch {};
+        var text = out.written();
+        if (text.len > proto.max_payload) {
+            // Cut at a line boundary and say so.
+            const cut = std.mem.lastIndexOfScalar(u8, text[0 .. proto.max_payload - 32], '\n') orelse proto.max_payload - 32;
+            text = text[0..cut];
+        }
+        self.link.send(.info_reply, id, text) catch {};
     }
 
     fn addListener(self: *Session, id: u32, payload: []const u8) void {

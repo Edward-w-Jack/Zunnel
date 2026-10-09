@@ -101,6 +101,20 @@ zunnel> ifaces                                     # interfaces, agents, routes,
 Wherever a command takes an `<agent>`, use its session number or a unique prefix of its IDENT, a
 stable id derived from the agent's host and user.
 
+### Seeing what's going on
+
+```
+zunnel> ifconfig 1                                 # agent's interfaces, gateway, and suggested routes
+zunnel> session info 1                             # ident, host, pid, uptime, link bytes, tunnels, listeners
+zunnel> flows                                      # live connections with up/down byte counts
+zunnel> ifaces                                     # per-interface totals and dial outcomes
+```
+
+`ifconfig` lists the networks the agent can reach as ready-to-run `route add` commands, and marks
+the one that carries the agent's own link to the proxy, which you must not route. Events (agents
+joining or leaving, routes, interfaces, bindings, listeners, `kill`) are printed with the time.
+`-log ops.log` also appends them, with full UTC timestamps, to a file.
+
 ### Reconnecting agents
 
 `start` binds the interface to the agent's IDENT, and listeners belong to the IDENT too. When an
@@ -177,6 +191,8 @@ agents are disconnected (`-retry` agents reconnect when the proxy comes back).
 | `-secret <s>` | from key file | override the shared secret agents must present |
 | `-no-secret` | off | accept agents without a secret (warns at startup and on every join) |
 | `-config <file>` | | run console commands from a file at startup (see `save`) |
+| `-log <file>` | | append timestamped events and log lines to a file |
+| `-v` / `-q` | | verbose (debug) / quiet (warnings and events only) |
 | `-tun <name>` | `zunnel` | default interface name |
 | `-route <cidr>` | | route a network through the default interface (repeatable) |
 | `-autostart` | off | create the default interface at startup and attach the first agent |
@@ -200,6 +216,7 @@ sensitive shows up in process listings.
 | `-retry` | | `-Dagent-retry=` | reconnect forever (on by default for baked agents) |
 | `-insecure` | | | accept any proxy key and print its fingerprint |
 | `-q` | | | print nothing |
+| `-v` | | | verbose: also log each failed dial and port-unreachable |
 
 ```sh
 zig build -Drelease -Dtarget=x86_64-windows --prefix zig-out/op1 \
@@ -267,6 +284,8 @@ translates the result back into packets:
 - [x] P1 operations (part 1): agent config without arguments (flags > env > baked), stable
   host-derived agent identity, `kill` and `-expire`, shared secret by default, interface bindings
   and listeners that survive reconnects, `save` / `-config`
+- [x] P1 operations (part 2): agent `ifconfig` with route suggestions, `session info`, `flows` and
+  byte counters, timestamped logging and `-log`
 
 ## Roadmap
 
@@ -278,9 +297,9 @@ translates the result back into packets:
 - [x] Shared secret by default (generated into the key file); `-no-secret` warns loudly.
 - [x] Proxy config file: `save` writes interfaces, routes, bindings and listeners; `-config` restores them.
 - [x] `kill <agent>`, and an optional agent `-expire <time>` for engagement windows.
-- [ ] Agent `ifconfig` (interfaces and addresses) and `session info <id>`.
-- [ ] `flows [iface]` command, plus per-tunnel and per-agent byte and flow counters.
-- [ ] Timestamped logging, `-log <file>`, `-v`/`-q`, and an event log (joins, leaves, routes, listeners).
+- [x] Agent `ifconfig` (interfaces, addresses, gateway, suggested routes) and `session info`.
+- [x] `flows [iface]` command, plus per-flow, per-interface and per-link byte counters.
+- [x] Timestamped (UTC) logging, `-log <file>`, `-v`/`-q`, and an event log (joins, leaves, routes, listeners).
 - [ ] Console line editing, history and tab completion.
 - [ ] Console output that doesn't interleave with the prompt.
 
