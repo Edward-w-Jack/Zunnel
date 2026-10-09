@@ -38,6 +38,11 @@ pub const Table = struct {
     live: usize = 0,
     next_id: u32 = 0,
     on_dialed: ?DialHook = null,
+    /// Backstop against a peer that floods us with connects (the proxy also
+    /// caps dials per session).
+    dial_sem: std.Thread.Semaphore = .{ .permits = max_concurrent_dials },
+
+    pub const max_concurrent_dials = 512;
 
     pub fn init(gpa: Allocator, link: *Link) Table {
         return .{ .gpa = gpa, .link = link };
@@ -143,7 +148,8 @@ pub const Table = struct {
     }
 
     /// The peer asked us to open `target`; replies connect_ok / connect_fail.
-    pub fn dial(self: *Table, id: u32, transport: proto.Transport, target: std.net.Address) void {
+    /// `timeout_ms` = 0 uses `proto.default_dial_timeout_ms`.
+    pub fn dial(self: *Table, id: u32, transport: proto.Transport, target: std.net.Address, timeout_ms: u16) void {
         if (transport != .tcp and transport != .udp) {
             self.link.send(.connect_fail, id, &.{@intFromEnum(proto.FailReason.other)}) catch {};
             return;
@@ -154,6 +160,7 @@ pub const Table = struct {
             .transport = transport,
             .target = target,
             .open_dirs = if (transport == .tcp) 2 else 1,
+            .dial_timeout_ms = if (timeout_ms == 0) proto.default_dial_timeout_ms else timeout_ms,
         }) orelse {
             self.link.send(.connect_fail, id, &.{@intFromEnum(proto.FailReason.other)}) catch {};
             return;
@@ -244,6 +251,7 @@ pub const Flow = struct {
     /// Directions still running; the flow is finished when this reaches 0.
     open_dirs: u8,
     last_active: std.atomic.Value(i64) = .init(0),
+    dial_timeout_ms: u32 = proto.default_dial_timeout_ms,
 
     pub fn retain(self: *Flow) void {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -394,14 +402,18 @@ pub const Flow = struct {
     fn tcpDialMain(self: *Flow) void {
         defer self.release();
         const table = self.table;
-        const stream = std.net.tcpConnectToAddress(self.target) catch |err| {
-            log.debug("flow {x}: dial {f} failed: {s}", .{ self.id, self.target, @errorName(err) });
-            return self.fail(proto.FailReason.fromError(err));
+        const h = blk: {
+            table.dial_sem.wait();
+            defer table.dial_sem.post();
+            break :blk sock.tcpConnect(self.target, self.dial_timeout_ms) catch |err| {
+                log.debug("flow {x}: dial {f} failed: {s}", .{ self.id, self.target, @errorName(err) });
+                return self.fail(proto.FailReason.fromError(err));
+            };
         };
-        sock.setNoDelay(stream.handle);
+        sock.setNoDelay(h);
 
         self.mutex.lock();
-        self.handle = stream.handle;
+        self.handle = h;
         const aborted = self.aborted;
         if (!aborted) self.state = .open;
         self.mutex.unlock();
@@ -411,7 +423,7 @@ pub const Flow = struct {
             self.abort(false);
             return self.unlink();
         };
-        if (table.on_dialed) |hook| hook.func(hook.ctx, self.target, stream.handle);
+        if (table.on_dialed) |hook| hook.func(hook.ctx, self.target, h);
 
         self.startWriter();
         self.readLoop();

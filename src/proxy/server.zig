@@ -30,6 +30,8 @@ pub const Session = struct {
     relay: relay.Table,
     /// Next id for TUN flows / pings (guarded by netstack.lock).
     next_flow_id: u32 = 1,
+    /// TCP dials in flight across this agent's tunnels (guarded by netstack.lock).
+    dialing: u32 = 0,
 
     fn parseHello(self: *Session) void {
         var lines = std.mem.tokenizeScalar(u8, self.hello, '\n');
@@ -64,6 +66,10 @@ pub const Server = struct {
     listen_address: std.net.Address,
     default_iface: []const u8,
     default_localhost_net: tun.Cidr,
+    /// Sent with every TCP connect request.
+    dial_timeout_ms: u16 = proto.default_dial_timeout_ms,
+    /// Max TCP dials in flight per agent; further SYNs are dropped.
+    max_dials: u32 = 256,
 
     /// Guards everything below. Lock order: Server.mutex -> netstack.lock.
     mutex: std.Thread.Mutex = .{},
@@ -74,6 +80,12 @@ pub const Server = struct {
     next_listener_id: u32 = 1,
     /// Local port of a relay dial into our own listener -> upstream session id.
     relay_ports: std.AutoHashMapUnmanaged(u16, u32) = .empty,
+    /// Handshakes in progress, total and per source address.
+    handshakes: u32 = 0,
+    handshakes_per_ip: std.AutoHashMapUnmanaged([16]u8, u8) = .empty,
+
+    const max_handshakes = 64;
+    const max_handshakes_per_ip = 8;
 
     pub fn listen(self: *Server) !void {
         const listener = try self.listen_address.listen(.{ .reuse_address = true });
@@ -95,7 +107,13 @@ pub const Server = struct {
                 std.Thread.sleep(std.time.ns_per_s);
                 continue;
             };
+            if (!self.beginHandshake(conn.address)) {
+                log.warn("too many handshakes in progress, dropping {f}", .{conn.address});
+                conn.stream.close();
+                continue;
+            }
             const t = std.Thread.spawn(.{}, sessionMain, .{ self, conn }) catch {
+                self.endHandshake(conn.address);
                 conn.stream.close();
                 continue;
             };
@@ -103,9 +121,41 @@ pub const Server = struct {
         }
     }
 
+    fn ipKey(a: std.net.Address) [16]u8 {
+        var k = [_]u8{0} ** 16;
+        if (a.any.family == std.posix.AF.INET6) k = a.in6.sa.addr else k[0..4].* = std.mem.asBytes(&a.in.sa.addr).*;
+        return k;
+    }
+
+    /// Admits a new handshake unless the global or per-address limit is reached.
+    fn beginHandshake(self: *Server, from: std.net.Address) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.handshakes >= max_handshakes) return false;
+        const gop = self.handshakes_per_ip.getOrPut(self.gpa, ipKey(from)) catch return false;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        if (gop.value_ptr.* >= max_handshakes_per_ip) return false;
+        gop.value_ptr.* += 1;
+        self.handshakes += 1;
+        return true;
+    }
+
+    fn endHandshake(self: *Server, from: std.net.Address) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.handshakes -= 1;
+        const key = ipKey(from);
+        if (self.handshakes_per_ip.getPtr(key)) |n| {
+            n.* -= 1;
+            if (n.* == 0) _ = self.handshakes_per_ip.remove(key);
+        }
+    }
+
     fn sessionMain(self: *Server, conn: std.net.Server.Connection) void {
         var hello_buf: [common.link.max_hello_len]u8 = undefined;
-        const hs = common.link.serverHandshake(self.gpa, conn.stream.handle, self.static, self.psk, &hello_buf) catch |err| {
+        const hs_result = common.link.serverHandshake(self.gpa, conn.stream.handle, self.static, self.psk, &hello_buf);
+        self.endHandshake(conn.address);
+        const hs = hs_result catch |err| {
             switch (err) {
                 error.AuthenticationFailed => log.warn("rejected agent {f}: wrong -secret (or an agent from a different zunnel version)", .{conn.address}),
                 else => log.warn("handshake with {f} failed: {s}", .{ conn.address, @errorName(err) }),
@@ -227,7 +277,7 @@ pub const Server = struct {
             for (self.listeners.items) |l| if (l.id == acc.listener_id and l.session == s) break :blk l;
             break :blk null;
         } orelse return s.link.send(.connect_fail, frame.id, &fail) catch {};
-        s.relay.dial(frame.id, l.transport, l.target);
+        s.relay.dial(frame.id, l.transport, l.target, 0);
     }
 
     fn onRelayDialed(ctx: *anyopaque, target: std.net.Address, h: sock.Handle) void {

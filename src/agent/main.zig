@@ -176,7 +176,7 @@ const Session = struct {
             .connect => {
                 const req = proto.ConnectRequest.decode(frame.payload) catch
                     return self.link.send(.connect_fail, frame.id, &.{@intFromEnum(proto.FailReason.other)});
-                self.table.dial(frame.id, req.transport, targetAddress(req));
+                self.table.dial(frame.id, req.transport, targetAddress(req), req.timeout_ms);
             },
             .icmp_echo => self.icmpEcho(frame.id, frame.payload),
             .listener_add => self.addListener(frame.id, frame.payload),

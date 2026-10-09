@@ -24,6 +24,8 @@ const usage =
     \\  -autostart           create the default interface at startup and attach the first agent
     \\  -localhost-net <cidr> destinations in this network reach the agent's 127.0.0.1
     \\                       (default 240.0.0.0/4; Windows cannot route 240/4, use e.g. 198.18.255.0/24)
+    \\  -dial-timeout <ms>   how long agents try to connect before giving up (default 3000)
+    \\  -max-dials <n>       max connects in flight per agent; extra SYNs are dropped (default 256)
     \\
 ;
 
@@ -35,6 +37,8 @@ const Options = struct {
     localhost_net: tun.Cidr = tun.Cidr.parse("240.0.0.0/4") catch unreachable,
     routes: std.ArrayList([]const u8) = .empty,
     autostart: bool = false,
+    dial_timeout_ms: u16 = common.proto.default_dial_timeout_ms,
+    max_dials: u32 = 256,
 };
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
@@ -66,6 +70,12 @@ fn parseArgs(gpa: Allocator, args: []const [:0]u8) !Options {
             o.secret = v;
         } else if (std.mem.eql(u8, a, "localhost-net")) {
             o.localhost_net = tun.Cidr.parse(v) catch fatal("invalid -localhost-net '{s}'", .{v});
+        } else if (std.mem.eql(u8, a, "dial-timeout")) {
+            o.dial_timeout_ms = std.fmt.parseInt(u16, v, 10) catch fatal("invalid -dial-timeout '{s}' (milliseconds, max 65535)", .{v});
+            if (o.dial_timeout_ms == 0) fatal("-dial-timeout must be > 0", .{});
+        } else if (std.mem.eql(u8, a, "max-dials")) {
+            o.max_dials = std.fmt.parseInt(u32, v, 10) catch fatal("invalid -max-dials '{s}'", .{v});
+            if (o.max_dials == 0) fatal("-max-dials must be > 0", .{});
         } else if (std.mem.eql(u8, a, "tun")) {
             o.tun_name = v;
         } else if (std.mem.eql(u8, a, "route")) {
@@ -96,6 +106,8 @@ pub fn main() !void {
         .listen_address = opts.listen,
         .default_iface = opts.tun_name,
         .default_localhost_net = opts.localhost_net,
+        .dial_timeout_ms = opts.dial_timeout_ms,
+        .max_dials = opts.max_dials,
     };
     var console: Console = .{ .gpa = gpa, .server = &server, .pending_routes = opts.routes };
     if (opts.autostart) _ = console.ensureTunnel(opts.tun_name) orelse std.process.exit(1);

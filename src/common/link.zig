@@ -14,11 +14,12 @@ const proto = @import("proto.zig");
 const sock = @import("sock.zig");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.link);
 
 const max_record_plain = 60 * 1024;
 const max_record = max_record_plain + noise.tag_len;
 const max_hello = 4096;
-const handshake_timeout_ms = 15_000;
+const handshake_timeout_ms = 10_000;
 /// Droppable (UDP) frames are discarded once this much is queued.
 const soft_queue_limit = 8 * 1024 * 1024;
 
@@ -39,6 +40,8 @@ pub const Link = struct {
     queue: std.ArrayList(u8) = .empty,
     closed: bool = false,
     writer: ?std.Thread = null,
+    /// When the last record arrived (ms); the writer closes the link when it goes stale.
+    last_rx: std.atomic.Value(i64) = .init(0),
 
     rx_buf: [max_record]u8 = undefined,
     rx_pos: usize = 0,
@@ -47,7 +50,10 @@ pub const Link = struct {
     fn create(gpa: Allocator, handle: sock.Handle, t: noise.Transport) !*Link {
         const self = try gpa.create(Link);
         self.* = .{ .gpa = gpa, .handle = handle, .tx = t.send, .rx = t.recv };
+        self.last_rx.store(std.time.milliTimestamp(), .monotonic);
         errdefer gpa.destroy(self);
+        // A peer that stops reading for this long is as dead as a silent one.
+        sock.setSendTimeout(handle, proto.link_dead_after_ms);
         self.writer = try std.Thread.spawn(.{}, writerLoop, .{self});
         return self;
     }
@@ -66,6 +72,10 @@ pub const Link = struct {
     pub fn close(self: *Link) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.closeLocked();
+    }
+
+    fn closeLocked(self: *Link) void {
         if (self.closed) return;
         self.closed = true;
         sock.shutdown(self.handle, .both);
@@ -99,6 +109,10 @@ pub const Link = struct {
         defer self.mutex.unlock();
         if (self.closed) return error.Closed;
         if (droppable and self.queue.items.len > soft_queue_limit) return;
+        try self.enqueueLocked(ftype, id, payload);
+    }
+
+    fn enqueueLocked(self: *Link, ftype: proto.FrameType, id: u32, payload: []const u8) error{OutOfMemory}!void {
         var hdr: [proto.header_len]u8 = undefined;
         proto.writeHeader(&hdr, ftype, id, @intCast(payload.len));
         try self.queue.ensureUnusedCapacity(self.gpa, hdr.len + payload.len);
@@ -116,12 +130,29 @@ pub const Link = struct {
         };
         defer self.gpa.free(out);
 
+        var last_ping = std.time.milliTimestamp();
         while (true) {
             {
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                while (self.queue.items.len == 0 and !self.closed) self.cond.wait(&self.mutex);
-                if (self.closed) return;
+                while (true) {
+                    if (self.closed) return;
+                    // Heartbeat: both ends ping; whatever arrives refreshes last_rx.
+                    const now = std.time.milliTimestamp();
+                    if (now - self.last_rx.load(.monotonic) > proto.link_dead_after_ms) {
+                        log.warn("link timed out: nothing received for {d}s", .{@divTrunc(proto.link_dead_after_ms, 1000)});
+                        self.closeLocked();
+                        return;
+                    }
+                    if (now - last_ping >= proto.heartbeat_interval_ms) {
+                        last_ping = now;
+                        var ts: [8]u8 = undefined;
+                        std.mem.writeInt(i64, &ts, now, .big);
+                        self.enqueueLocked(.ping, 0, &ts) catch {};
+                    }
+                    if (self.queue.items.len > 0) break;
+                    self.cond.timedWait(&self.mutex, std.time.ns_per_s) catch {};
+                }
                 std.mem.swap(std.ArrayList(u8), &self.queue, &batch);
             }
 
@@ -175,6 +206,7 @@ pub const Link = struct {
         try self.rx.decrypt(self.rx_buf[0..plain_len], "", self.rx_buf[0..len]);
         self.rx_pos = 0;
         self.rx_len = plain_len;
+        self.last_rx.store(std.time.milliTimestamp(), .monotonic);
     }
 };
 

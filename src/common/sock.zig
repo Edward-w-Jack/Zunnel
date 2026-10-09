@@ -79,13 +79,126 @@ pub fn close(h: Handle) void {
 
 /// 0 disables the timeout.
 pub fn setRecvTimeout(h: Handle, ms: u32) void {
+    setTimeout(h, if (is_windows) ws2.SO.RCVTIMEO else posix.SO.RCVTIMEO, ms);
+}
+
+/// 0 disables the timeout. A send that cannot make progress for `ms` fails.
+pub fn setSendTimeout(h: Handle, ms: u32) void {
+    setTimeout(h, if (is_windows) ws2.SO.SNDTIMEO else posix.SO.SNDTIMEO, ms);
+}
+
+fn setTimeout(h: Handle, opt: anytype, ms: u32) void {
     if (is_windows) {
         const v: u32 = ms;
-        _ = ws2.setsockopt(h, ws2.SOL.SOCKET, ws2.SO.RCVTIMEO, std.mem.asBytes(&v), @sizeOf(u32));
+        _ = ws2.setsockopt(h, ws2.SOL.SOCKET, opt, std.mem.asBytes(&v), @sizeOf(u32));
     } else {
         const tv: posix.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-        posix.setsockopt(h, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        posix.setsockopt(h, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv)) catch {};
     }
+}
+
+pub const ConnectError = error{
+    ConnectionRefused,
+    ConnectionTimedOut,
+    NetworkUnreachable,
+    HostUnreachable,
+    AccessDenied,
+    ConnectFailed,
+};
+
+/// Connects a TCP socket to `addr`, giving up after `timeout_ms`. The returned
+/// socket is in blocking mode.
+pub fn tcpConnect(addr: std.net.Address, timeout_ms: u32) ConnectError!Handle {
+    return if (is_windows) tcpConnectWindows(addr, timeout_ms) else tcpConnectPosix(addr, timeout_ms);
+}
+
+fn tcpConnectPosix(addr: std.net.Address, timeout_ms: u32) ConnectError!Handle {
+    const h = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch
+        return error.ConnectFailed;
+    errdefer close(h);
+    posix.connect(h, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {
+            var fds = [_]posix.pollfd{.{ .fd = h, .events = posix.POLL.OUT, .revents = 0 }};
+            const n = posix.poll(&fds, @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch return error.ConnectFailed;
+            if (n == 0) return error.ConnectionTimedOut;
+            var code: i32 = 0;
+            posix.getsockopt(h, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&code)) catch return error.ConnectFailed;
+            if (code != 0) return switch (@as(posix.E, @enumFromInt(code))) {
+                .CONNREFUSED => error.ConnectionRefused,
+                .TIMEDOUT => error.ConnectionTimedOut,
+                .NETUNREACH => error.NetworkUnreachable,
+                .HOSTUNREACH => error.HostUnreachable,
+                .ACCES, .PERM => error.AccessDenied,
+                else => error.ConnectFailed,
+            };
+        },
+        error.ConnectionRefused => return error.ConnectionRefused,
+        error.NetworkUnreachable => return error.NetworkUnreachable,
+        error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
+        error.ConnectionTimedOut => return error.ConnectionTimedOut,
+        else => return error.ConnectFailed,
+    };
+    // Back to blocking mode for the relay threads.
+    const flags = posix.fcntl(h, posix.F.GETFL, 0) catch return error.ConnectFailed;
+    var o: posix.O = @bitCast(@as(std.meta.Int(.unsigned, @bitSizeOf(posix.O)), @truncate(flags)));
+    o.NONBLOCK = false;
+    _ = posix.fcntl(h, posix.F.SETFL, @as(std.meta.Int(.unsigned, @bitSizeOf(posix.O)), @bitCast(o))) catch return error.ConnectFailed;
+    return h;
+}
+
+fn tcpConnectWindows(addr: std.net.Address, timeout_ms: u32) ConnectError!Handle {
+    const h = posix.socket(addr.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch return error.ConnectFailed;
+    errdefer close(h);
+    var nonblocking: u32 = 1;
+    if (ws2.ioctlsocket(h, ws2.FIONBIO, &nonblocking) == ws2.SOCKET_ERROR) return error.ConnectFailed;
+
+    if (ws2.connect(h, &addr.any, @intCast(addr.getOsSockLen())) == ws2.SOCKET_ERROR) {
+        switch (ws2.WSAGetLastError()) {
+            .WSAEWOULDBLOCK => {},
+            else => |e| return mapWsaConnectError(@intFromEnum(e)),
+        }
+        // select() reports a finished connect as writable and a failed one in
+        // the except set (more reliable than WSAPoll for failed connects).
+        var wfds: ws2.fd_set = .{ .fd_count = 1, .fd_array = undefined };
+        var efds: ws2.fd_set = .{ .fd_count = 1, .fd_array = undefined };
+        wfds.fd_array[0] = h;
+        efds.fd_array[0] = h;
+        const tv: ws2.timeval = .{ .sec = @intCast(timeout_ms / 1000), .usec = @intCast((timeout_ms % 1000) * 1000) };
+        const n = ws2.select(0, null, &wfds, &efds, &tv);
+        if (n == ws2.SOCKET_ERROR) return error.ConnectFailed;
+        if (n == 0) return error.ConnectionTimedOut;
+        var code: i32 = 0;
+        var len: i32 = @sizeOf(i32);
+        if (ws2.getsockopt(h, ws2.SOL.SOCKET, ws2.SO.ERROR, std.mem.asBytes(&code), &len) == ws2.SOCKET_ERROR)
+            return error.ConnectFailed;
+        if (code != 0) return mapWsaConnectError(@intCast(code));
+    }
+    var blocking: u32 = 0;
+    if (ws2.ioctlsocket(h, ws2.FIONBIO, &blocking) == ws2.SOCKET_ERROR) return error.ConnectFailed;
+    return h;
+}
+
+/// Raw Winsock error codes (SO_ERROR may hold values outside std's enum).
+fn mapWsaConnectError(code: u32) ConnectError {
+    return switch (code) {
+        10061 => error.ConnectionRefused, // WSAECONNREFUSED
+        10060 => error.ConnectionTimedOut, // WSAETIMEDOUT
+        10051 => error.NetworkUnreachable, // WSAENETUNREACH
+        10065 => error.HostUnreachable, // WSAEHOSTUNREACH
+        10013 => error.AccessDenied, // WSAEACCES
+        else => error.ConnectFailed,
+    };
+}
+
+test "tcpConnect: refused fast, unroutable times out" {
+    // Nothing listens on port 1 of loopback.
+    try std.testing.expectError(error.ConnectionRefused, tcpConnect(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 1), 5000));
+    // A blackholed address must give up close to the timeout, not after the OS default.
+    const start = std.time.milliTimestamp();
+    if (tcpConnect(std.net.Address.initIp4(.{ 10, 255, 255, 1 }, 9), 300)) |h| {
+        close(h);
+    } else |_| {}
+    try std.testing.expect(std.time.milliTimestamp() - start < 2000);
 }
 
 pub fn setKeepAlive(h: Handle) void {

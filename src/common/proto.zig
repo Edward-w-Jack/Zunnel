@@ -9,8 +9,14 @@
 const std = @import("std");
 
 /// Bump the digit whenever the handshake or framing changes incompatibly.
-pub const magic = "ZNL3";
+pub const magic = "ZNL4";
 pub const default_port: u16 = 11601;
+/// Both ends send a ping this often...
+pub const heartbeat_interval_ms = 10_000;
+/// ...and drop the link when nothing has arrived for this long.
+pub const link_dead_after_ms = 30_000;
+/// Dial timeout used when a connect request does not carry one.
+pub const default_dial_timeout_ms: u16 = 3000;
 pub const header_len = 8;
 pub const max_payload = 16 * 1024;
 /// Per-flow, per-direction flow-control window for TCP flows.
@@ -51,6 +57,9 @@ pub const FrameType = enum(u8) {
     /// flow id (payload: listener id u32be | Endpoint of the peer). The proxy
     /// answers with connect_ok / connect_fail like the agent does for `connect`.
     accepted = 16,
+    /// agent -> proxy: the target answered a UDP flow with ICMP unreachable
+    /// (payload: ICMP code u8, 3 = port unreachable). The flow stays open.
+    icmp_unreachable = 17,
     _,
 };
 
@@ -82,13 +91,18 @@ pub const FailReason = enum(u8) {
     unreachable_host = 2,
     timeout = 3,
     other = 4,
+    unreachable_net = 5,
+    /// Blocked locally (e.g. by a host firewall on the agent).
+    prohibited = 6,
     _,
 
     pub fn fromError(err: anyerror) FailReason {
         return switch (err) {
             error.ConnectionRefused => .refused,
-            error.NetworkUnreachable, error.HostUnreachable, error.AddressNotAvailable => .unreachable_host,
+            error.NetworkUnreachable => .unreachable_net,
+            error.HostUnreachable, error.AddressNotAvailable => .unreachable_host,
             error.ConnectionTimedOut, error.Timeout => .timeout,
+            error.AccessDenied, error.PermissionDenied => .prohibited,
             else => .other,
         };
     }
@@ -99,8 +113,10 @@ pub const ConnectRequest = struct {
     /// 4 bytes for IPv4, 16 for IPv6.
     addr: []const u8,
     port: u16,
+    /// Dial timeout for `connect` (0 = not sent; the agent uses its default).
+    timeout_ms: u16 = 0,
 
-    pub const max_len = 4 + 16;
+    pub const max_len = 4 + 16 + 2;
 
     pub fn encode(self: ConnectRequest, buf: *[max_len]u8) []u8 {
         std.debug.assert(self.addr.len == 4 or self.addr.len == 16);
@@ -108,17 +124,28 @@ pub const ConnectRequest = struct {
         std.mem.writeInt(u16, buf[1..3], self.port, .big);
         buf[3] = @intCast(self.addr.len);
         @memcpy(buf[4..][0..self.addr.len], self.addr);
-        return buf[0 .. 4 + self.addr.len];
+        const end = 4 + self.addr.len;
+        if (self.timeout_ms == 0) return buf[0..end];
+        std.mem.writeInt(u16, buf[end..][0..2], self.timeout_ms, .big);
+        return buf[0 .. end + 2];
     }
 
     pub fn decode(payload: []const u8) error{InvalidMessage}!ConnectRequest {
         if (payload.len < 4) return error.InvalidMessage;
         const alen = payload[3];
-        if ((alen != 4 and alen != 16) or payload.len != 4 + @as(usize, alen)) return error.InvalidMessage;
+        if (alen != 4 and alen != 16) return error.InvalidMessage;
+        const end = 4 + @as(usize, alen);
+        const timeout_ms: u16 = if (payload.len == end)
+            0
+        else if (payload.len == end + 2)
+            std.mem.readInt(u16, payload[end..][0..2], .big)
+        else
+            return error.InvalidMessage;
         return .{
             .transport = @enumFromInt(payload[0]),
             .port = std.mem.readInt(u16, payload[1..3], .big),
-            .addr = payload[4..][0..alen],
+            .addr = payload[4..end],
+            .timeout_ms = timeout_ms,
         };
     }
 };
@@ -200,4 +227,17 @@ test "connect request round trip" {
     try std.testing.expectEqual(Transport.tcp, dec.transport);
     try std.testing.expectEqual(@as(u16, 445), dec.port);
     try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, dec.addr);
+    try std.testing.expectEqual(@as(u16, 0), dec.timeout_ms);
+
+    const enc2 = (ConnectRequest{ .transport = .tcp, .addr = &.{ 10, 0, 0, 2 }, .port = 22, .timeout_ms = 2500 }).encode(&buf);
+    try std.testing.expectEqual(@as(u16, 2500), (try ConnectRequest.decode(enc2)).timeout_ms);
+    try std.testing.expectError(error.InvalidMessage, ConnectRequest.decode(enc2[0 .. enc2.len - 1]));
+}
+
+test "fail reason mapping" {
+    try std.testing.expectEqual(FailReason.refused, FailReason.fromError(error.ConnectionRefused));
+    try std.testing.expectEqual(FailReason.timeout, FailReason.fromError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(FailReason.unreachable_net, FailReason.fromError(error.NetworkUnreachable));
+    try std.testing.expectEqual(FailReason.unreachable_host, FailReason.fromError(error.HostUnreachable));
+    try std.testing.expectEqual(FailReason.prohibited, FailReason.fromError(error.AccessDenied));
 }

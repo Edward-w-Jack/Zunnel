@@ -91,6 +91,8 @@ const Flow = struct {
     /// The client's SYN, replayed into lwIP once the agent connected.
     syn: ?[]u8 = null,
     syn_seq: u32 = 0,
+    /// Set while this flow counts against `Session.dialing`.
+    dial_session: ?*Session = null,
     pcb: ?*c.struct_tcp_pcb = null,
     /// client -> agent bytes waiting for agent credit (lwIP window stays closed meanwhile).
     from_client: ByteQueue = .{},
@@ -384,14 +386,25 @@ pub const Tunnel = struct {
     }
 
     fn sendConnect(self: *Tunnel, flow: *Flow, transport: proto.Transport) !void {
+        const session = self.session.?;
         var buf: [proto.ConnectRequest.max_len]u8 = undefined;
-        const req: proto.ConnectRequest = .{ .transport = transport, .addr = self.agentAddress(&flow.tuple.dst), .port = flow.tuple.dport };
-        try self.session.?.link.send(.connect, flow.id, req.encode(&buf));
+        const req: proto.ConnectRequest = .{
+            .transport = transport,
+            .addr = self.agentAddress(&flow.tuple.dst),
+            .port = flow.tuple.dport,
+            .timeout_ms = if (transport == .tcp) session.server.dial_timeout_ms else 0,
+        };
+        try session.link.send(.connect, flow.id, req.encode(&buf));
     }
 
     fn newTcpFlow(self: *Tunnel, t: Tuple, seq: u32, syn: []const u8) void {
-        if (self.session == null) return self.sendRst(t, seq);
+        const session = self.session orelse return self.sendRst(t, seq);
+        // Too many dials in flight for this agent: drop the SYN. The client
+        // retransmits, which looks like congestion and slows scanners down.
+        if (session.dialing >= session.server.max_dials) return;
         const flow = self.newFlow(t) catch return;
+        flow.dial_session = session;
+        session.dialing += 1;
         flow.syn_seq = seq;
         flow.syn = self.gpa.dupe(u8, syn) catch return self.abortFlow(flow, false);
         self.sendConnect(flow, .tcp) catch return self.abortFlow(flow, false);
@@ -459,6 +472,7 @@ pub const Tunnel = struct {
         switch (frame.type) {
             .connect_ok => if (flow.state == .dialing) {
                 flow.state = .open;
+                endDial(flow);
                 if (flow.syn) |syn| {
                     flow.syn = null;
                     self.feed(syn);
@@ -594,6 +608,7 @@ pub const Tunnel = struct {
     }
 
     fn destroyFlow(self: *Tunnel, flow: *Flow) void {
+        endDial(flow);
         _ = self.flows.remove(flow.id);
         _ = self.by_tuple.remove(flow.tuple);
         if (flow.syn) |s| self.gpa.free(s);
@@ -602,6 +617,13 @@ pub const Tunnel = struct {
         self.gpa.destroy(flow);
     }
 };
+
+/// Releases the flow's slot in its session's dial budget (idempotent).
+fn endDial(flow: *Flow) void {
+    const s = flow.dial_session orelse return;
+    s.dialing -= 1;
+    flow.dial_session = null;
+}
 
 fn detachPcb(pcb: *c.struct_tcp_pcb) void {
     c.tcp_arg(pcb, null);
