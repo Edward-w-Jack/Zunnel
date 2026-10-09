@@ -188,12 +188,9 @@ pub const Link = struct {
     /// Only one thread may read from a link.
     pub fn recvFrame(self: *Link) !Frame {
         if (self.rx_pos >= self.rx_len) try self.readRecord();
-        const rest = self.rx_buf[self.rx_pos..self.rx_len];
-        if (rest.len < proto.header_len) return error.InvalidMessage;
-        const h = proto.parseHeader(rest[0..proto.header_len]);
-        if (rest.len < proto.header_len + @as(usize, h.len)) return error.InvalidMessage;
-        self.rx_pos += proto.header_len + h.len;
-        return .{ .type = h.type, .id = h.id, .payload = rest[proto.header_len..][0..h.len] };
+        const frame, const used = try parseFrame(self.rx_buf[self.rx_pos..self.rx_len]);
+        self.rx_pos += used;
+        return frame;
     }
 
     fn readRecord(self: *Link) !void {
@@ -209,6 +206,47 @@ pub const Link = struct {
         self.last_rx.store(std.time.milliTimestamp(), .monotonic);
     }
 };
+
+/// Parses the frame at the start of `buf` (decrypted record contents) and
+/// returns it with the number of bytes it occupies. The payload aliases `buf`.
+pub fn parseFrame(buf: []const u8) error{InvalidMessage}!struct { Frame, usize } {
+    if (buf.len < proto.header_len) return error.InvalidMessage;
+    const h = proto.parseHeader(buf[0..proto.header_len]);
+    const total = proto.header_len + @as(usize, h.len);
+    if (buf.len < total) return error.InvalidMessage;
+    return .{ .{ .type = h.type, .id = h.id, .payload = buf[proto.header_len..total] }, total };
+}
+
+test parseFrame {
+    var buf: [proto.header_len + 3]u8 = undefined;
+    proto.writeHeader(buf[0..proto.header_len], .data, 42, 3);
+    buf[proto.header_len..].* = "abc".*;
+    const frame, const used = try parseFrame(&buf);
+    try std.testing.expectEqual(proto.FrameType.data, frame.type);
+    try std.testing.expectEqual(@as(u32, 42), frame.id);
+    try std.testing.expectEqualStrings("abc", frame.payload);
+    try std.testing.expectEqual(buf.len, used);
+    try std.testing.expectError(error.InvalidMessage, parseFrame(buf[0 .. buf.len - 1]));
+}
+
+test "fuzz parseFrame" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, input: []const u8) anyerror!void {
+            // Walk the input as a record: every frame must stay inside it.
+            var rest = input;
+            while (rest.len > 0) {
+                const frame, const used = parseFrame(rest) catch return;
+                try std.testing.expect(used >= proto.header_len and used <= rest.len);
+                try std.testing.expect(frame.payload.len == used - proto.header_len);
+                rest = rest[used..];
+            }
+        }
+    }.one, .{ .corpus = &.{
+        &.{ 6, 0, 0, 0, 0, 1, 0, 2, 'h', 'i' },
+        &.{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        &.{ 9, 0, 255, 255, 255, 255, 255, 255 },
+    } });
+}
 
 fn sendMsg(h: sock.Handle, msg: []const u8) !void {
     var lb: [2]u8 = undefined;

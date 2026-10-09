@@ -241,3 +241,31 @@ test "fail reason mapping" {
     try std.testing.expectEqual(FailReason.unreachable_host, FailReason.fromError(error.HostUnreachable));
     try std.testing.expectEqual(FailReason.prohibited, FailReason.fromError(error.AccessDenied));
 }
+
+test "fuzz decoders" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, input: []const u8) anyerror!void {
+            // Decoders must reject garbage with an error, never crash, and
+            // anything they accept must re-encode to the same bytes.
+            if (ConnectRequest.decode(input)) |req| {
+                var buf: [ConnectRequest.max_len]u8 = undefined;
+                try std.testing.expectEqualSlices(u8, input, req.encode(&buf));
+                _ = endpointAddress(req);
+            } else |_| {}
+            if (Accepted.decode(input)) |acc| {
+                var buf: [Accepted.max_len]u8 = undefined;
+                try std.testing.expectEqualSlices(u8, input, acc.encode(&buf));
+            } else |_| {}
+            if (IcmpEcho.decode(input)) |e| {
+                try std.testing.expectEqualSlices(u8, input, &e.encode());
+            } else |_| {}
+            if (input.len >= header_len) _ = parseHeader(input[0..header_len]);
+        }
+    }.one, .{ .corpus = &.{
+        &.{ 6, 0, 80, 4, 10, 0, 0, 1 },
+        &.{ 6, 0, 80, 4, 10, 0, 0, 1, 11, 184 },
+        &.{ 17, 0, 53, 16, 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        &.{ 0, 0, 0, 7, 6, 0, 22, 4, 192, 168, 1, 7 },
+        &.{ 10, 0, 0, 1, 7, 208 },
+    } });
+}

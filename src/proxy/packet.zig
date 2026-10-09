@@ -227,3 +227,35 @@ test "udp round trip and checksums" {
     try std.testing.expectEqual(@as(u16, 53), udp.sport);
     try std.testing.expectEqualStrings("hi", udp.data);
 }
+
+test "fuzz packet parsing and replies" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, input: []const u8) anyerror!void {
+            // Packets come straight from the TUN: parsing must never read out
+            // of bounds, and replies built from them must be well-formed.
+            const ip = parseIp4(input) orelse return;
+            try std.testing.expect(ip.payload.len <= input.len);
+            var out: [65536 + 64]u8 = undefined;
+            switch (ip.proto) {
+                proto_tcp => _ = parseTcp(ip.payload),
+                proto_udp => if (parseUdp(ip.payload)) |u| try std.testing.expect(u.data.len <= ip.payload.len),
+                proto_icmp => if (buildIcmpEchoReply4(&out, ip)) |reply| {
+                    try std.testing.expectEqual(@as(u16, 0), fold(sum16(reply[0..20], 0)));
+                    try std.testing.expectEqual(@as(u16, 0), fold(sum16(reply[20..], 0)));
+                },
+                else => {},
+            }
+            if (buildIcmpUnreachable4(&out, unreach_host, input)) |msg| {
+                try std.testing.expect(msg.len <= 20 + 8 + 60 + 8);
+                try std.testing.expectEqual(@as(u16, 0), fold(sum16(msg[20..], 0)));
+            }
+        }
+    }.one, .{ .corpus = &.{
+        // IPv4/UDP 10.0.0.2:40000 -> 10.0.0.9:161, 5-byte payload
+        &.{ 0x45, 0, 0, 33, 0, 0, 0x40, 0, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 9, 0x9c, 0x40, 0, 161, 0, 13, 0, 0, 'p', 'r', 'o', 'b', 'e' },
+        // IPv4/ICMP echo request with 4 payload bytes
+        &.{ 0x45, 0, 0, 32, 0, 0, 0x40, 0, 64, 1, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1, 8, 0, 0, 0, 0x12, 0x34, 0, 1, 'p', 'i', 'n', 'g' },
+        // IPv4/TCP SYN header only
+        &.{ 0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 2, 10, 0, 0, 9, 0x9c, 0x40, 0, 22, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 2, 0xff, 0xff, 0, 0, 0, 0 },
+    } });
+}

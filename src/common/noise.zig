@@ -272,3 +272,22 @@ test "NKpsk0 responder rejects wrong psk in message 1" {
     var p1: [64]u8 = undefined;
     try std.testing.expectError(error.AuthenticationFailed, res.readMessage1(try ini.writeMessage1(&m1, ""), &p1));
 }
+
+test "fuzz responder rejects garbage" {
+    // A fixed responder key keeps runs reproducible.
+    const server = try KeyPair.generateDeterministic([_]u8{7} ** 32);
+    try std.testing.fuzz(server, struct {
+        fn one(kp: KeyPair, input: []const u8) anyerror!void {
+            // Unauthenticated bytes from the network must fail cleanly: without
+            // the server's key (and psk) no input can pass the AEAD tag.
+            var res = Responder.init(kp, pskFromSecret("s"), "test");
+            var out: [512]u8 = undefined;
+            if (res.readMessage1(input, &out)) |_| {
+                return error.ForgedHandshakeAccepted;
+            } else |_| {}
+        }
+    }.one, .{ .corpus = &.{
+        &([_]u8{0} ** 48),
+        &([_]u8{0xff} ** 64),
+    } });
+}
