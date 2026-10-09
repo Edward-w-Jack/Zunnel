@@ -20,24 +20,96 @@ pub fn decode(text: []const u8) error{InvalidKey}![noise.key_len]u8 {
     return out;
 }
 
-/// Loads a private key (base64) from `path`, creating a fresh one if missing.
-pub fn loadOrCreate(path: []const u8) !struct { noise.KeyPair, bool } {
-    var buf: [256]u8 = undefined;
+/// Length of a generated shared secret (URL-safe base64 of 24 random bytes,
+/// so it pastes into any shell without quoting).
+pub const secret_len = 32;
+
+pub const ProxyIdentity = struct {
+    keypair: noise.KeyPair,
+    /// Shared secret agents must present.
+    secret: [secret_len]u8,
+    /// The key file did not exist and was created.
+    created: bool,
+    /// An existing key file had no secret yet; one was generated and saved.
+    added_secret: bool,
+};
+
+/// Loads the proxy's private key and shared secret from `path`:
+///
+///     <base64 private key>
+///     secret=<32 chars>
+///
+/// Creates the file if it is missing, and appends a fresh secret to key-only
+/// files written by older versions.
+pub fn loadOrCreate(path: []const u8) !ProxyIdentity {
+    var buf: [512]u8 = undefined;
     if (std.fs.cwd().readFile(path, &buf)) |contents| {
-        const secret = decode(contents) catch return error.InvalidKeyFile;
-        const public = try std.crypto.dh.X25519.recoverPublicKey(secret);
-        return .{ .{ .secret_key = secret, .public_key = public }, false };
+        const parsed = try parseKeyFile(contents);
+        const public = try std.crypto.dh.X25519.recoverPublicKey(parsed.private);
+        const kp: noise.KeyPair = .{ .secret_key = parsed.private, .public_key = public };
+        if (parsed.secret) |s| return .{ .keypair = kp, .secret = s, .created = false, .added_secret = false };
+        const secret = randomSecret();
+        try writeKeyFile(path, kp, secret);
+        return .{ .keypair = kp, .secret = secret, .created = false, .added_secret = true };
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
     const kp = noise.KeyPair.generate();
-    const text = encode(kp.secret_key);
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = &text ++ "\n" });
-    return .{ kp, true };
+    const secret = randomSecret();
+    try writeKeyFile(path, kp, secret);
+    return .{ .keypair = kp, .secret = secret, .created = true, .added_secret = false };
+}
+
+fn randomSecret() [secret_len]u8 {
+    var raw: [24]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    var out: [secret_len]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&out, &raw);
+    return out;
+}
+
+fn writeKeyFile(path: []const u8, kp: noise.KeyPair, secret: [secret_len]u8) !void {
+    const text = encode(kp.secret_key) ++ "\nsecret=" ++ secret ++ "\n";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = text[0..] });
+}
+
+fn parseKeyFile(contents: []const u8) error{InvalidKeyFile}!struct { private: [noise.key_len]u8, secret: ?[secret_len]u8 } {
+    var private: ?[noise.key_len]u8 = null;
+    var secret: ?[secret_len]u8 = null;
+    var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "secret=")) {
+            const s = line["secret=".len..];
+            if (s.len != secret_len) return error.InvalidKeyFile;
+            secret = s[0..secret_len].*;
+        } else if (private == null) {
+            private = decode(line) catch return error.InvalidKeyFile;
+        } else return error.InvalidKeyFile;
+    }
+    return .{ .private = private orelse return error.InvalidKeyFile, .secret = secret };
 }
 
 test "key round trip" {
     const kp = noise.KeyPair.generate();
     try std.testing.expectEqual(kp.public_key, try decode(&encode(kp.public_key)));
+}
+
+test "key file with and without a secret" {
+    const kp = noise.KeyPair.generate();
+    const old = encode(kp.secret_key) ++ "\n";
+    const p1 = try parseKeyFile(old[0..]);
+    try std.testing.expectEqual(kp.secret_key, p1.private);
+    try std.testing.expect(p1.secret == null);
+
+    const secret = randomSecret();
+    const new = encode(kp.secret_key) ++ "\r\nsecret=" ++ secret ++ "\r\n";
+    const p2 = try parseKeyFile(new[0..]);
+    try std.testing.expectEqual(kp.secret_key, p2.private);
+    try std.testing.expectEqualSlices(u8, &secret, &p2.secret.?);
+
+    try std.testing.expectError(error.InvalidKeyFile, parseKeyFile("secret=short\n"));
+    try std.testing.expectError(error.InvalidKeyFile, parseKeyFile(""));
 }

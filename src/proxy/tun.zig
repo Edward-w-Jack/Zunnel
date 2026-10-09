@@ -71,7 +71,22 @@ pub const Cidr = struct {
     pub fn contains(self: Cidr, ip: [4]u8) bool {
         return std.mem.readInt(u32, &ip, .big) & self.mask == self.net;
     }
+
+    /// Prints `a.b.c.d/bits` (use with `{f}`).
+    pub fn format(self: Cidr, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var ip: [4]u8 = undefined;
+        std.mem.writeInt(u32, &ip, self.net, .big);
+        try w.print("{d}.{d}.{d}.{d}/{d}", .{ ip[0], ip[1], ip[2], ip[3], @popCount(self.mask) });
+    }
 };
+
+test "cidr format round trip" {
+    var buf: [32]u8 = undefined;
+    for ([_][]const u8{ "240.0.0.0/4", "198.18.255.0/24", "10.1.2.3/32", "0.0.0.0/0" }) |text| {
+        const printed = try std.fmt.bufPrint(&buf, "{f}", .{try Cidr.parse(text)});
+        try std.testing.expectEqualStrings(text, printed);
+    }
+}
 
 test Cidr {
     const c = try Cidr.parse("240.0.0.0/4");

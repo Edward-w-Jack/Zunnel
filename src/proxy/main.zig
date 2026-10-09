@@ -19,8 +19,10 @@ const usage =
     \\usage: zunnel-proxy [options]
     \\
     \\  -listen <addr:port>  address agents connect to (default 0.0.0.0:11601)
-    \\  -key <file>          proxy private key, created if missing (default zunnel.key)
-    \\  -secret <secret>     shared secret agents must present (recommended)
+    \\  -key <file>          proxy key and shared secret, created if missing (default zunnel.key)
+    \\  -secret <secret>     override the shared secret stored in the key file
+    \\  -no-secret           accept agents without a secret (not recommended)
+    \\  -config <file>       run the console commands in <file> at startup (see `save`)
     \\  -tun <name>          default TUN interface name (default zunnel)
     \\  -route <cidr>        route a network through the default interface (repeatable)
     \\  -autostart           create the default interface at startup and attach the first agent
@@ -34,7 +36,9 @@ const usage =
 const Options = struct {
     listen: std.net.Address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, common.proto.default_port),
     key_file: []const u8 = "zunnel.key",
-    secret: []const u8 = "",
+    secret: ?[]const u8 = null,
+    no_secret: bool = false,
+    config_file: ?[]const u8 = null,
     tun_name: []const u8 = "zunnel",
     localhost_net: tun.Cidr = tun.Cidr.parse("240.0.0.0/4") catch unreachable,
     routes: std.ArrayList([]const u8) = .empty,
@@ -57,6 +61,10 @@ fn parseArgs(gpa: Allocator, args: []const [:0]u8) !Options {
             o.autostart = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "no-secret")) {
+            o.no_secret = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "h") or std.mem.eql(u8, a, "help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -70,6 +78,8 @@ fn parseArgs(gpa: Allocator, args: []const [:0]u8) !Options {
             o.key_file = v;
         } else if (std.mem.eql(u8, a, "secret")) {
             o.secret = v;
+        } else if (std.mem.eql(u8, a, "config")) {
+            o.config_file = v;
         } else if (std.mem.eql(u8, a, "localhost-net")) {
             o.localhost_net = tun.Cidr.parse(v) catch fatal("invalid -localhost-net '{s}'", .{v});
         } else if (std.mem.eql(u8, a, "dial-timeout")) {
@@ -96,15 +106,19 @@ pub fn main() !void {
     const opts = try parseArgs(gpa, args);
     if (privileges.check(opts.tun_name)) |problem| fatal("{s}", .{problem});
 
-    const static, const created = keys.loadOrCreate(opts.key_file) catch |err|
+    const ident = keys.loadOrCreate(opts.key_file) catch |err|
         fatal("cannot load key file '{s}': {s}", .{ opts.key_file, @errorName(err) });
-    if (created) std.debug.print("generated new key in {s}\n", .{opts.key_file});
-    const pubkey = keys.encode(static.public_key);
+    if (ident.created) std.debug.print("generated a new key and secret in {s}\n", .{opts.key_file});
+    if (ident.added_secret) std.debug.print("added a shared secret to {s}\n", .{opts.key_file});
+    const pubkey = keys.encode(ident.keypair.public_key);
+    if (opts.no_secret and opts.secret != null) fatal("-secret and -no-secret are mutually exclusive", .{});
+    const secret: []const u8 = if (opts.no_secret) "" else opts.secret orelse &ident.secret;
 
     var server: Server = .{
         .gpa = gpa,
-        .static = static,
-        .psk = common.noise.pskFromSecret(opts.secret),
+        .static = ident.keypair,
+        .psk = common.noise.pskFromSecret(secret),
+        .no_secret = opts.no_secret,
         .autostart = opts.autostart,
         .listen_address = opts.listen,
         .default_iface = opts.tun_name,
@@ -112,23 +126,29 @@ pub fn main() !void {
         .dial_timeout_ms = opts.dial_timeout_ms,
         .max_dials = opts.max_dials,
     };
-    var console: Console = .{ .gpa = gpa, .server = &server, .pending_routes = opts.routes };
+    var console: Console = .{ .gpa = gpa, .server = &server, .pending_routes = opts.routes, .config_path = opts.config_file };
     installShutdownHandlers(&server);
     if (opts.autostart) _ = console.ensureTunnel(opts.tun_name) orelse std.process.exit(1);
 
     server.listen() catch |err| fatal("cannot listen on {f}: {s}", .{ opts.listen, @errorName(err) });
 
-    std.debug.print(
-        \\zunnel proxy {s} listening on {f}
-        \\public key: {s}
-        \\agent:      zunnel-agent -connect <this-host>:{d} -pubkey {s}{s}{s}
-        \\type 'help' for commands
-        \\
-    , .{
-        common.version,        opts.listen, &pubkey,
-        opts.listen.getPort(), &pubkey,     if (opts.secret.len > 0) " -secret " else "",
-        if (opts.secret.len > 0) "<secret>" else "",
-    });
+    const port = opts.listen.getPort();
+    std.debug.print("zunnel proxy {s} listening on {f}\npublic key: {s}\n", .{ common.version, opts.listen, &pubkey });
+    if (secret.len > 0) {
+        std.debug.print(
+            \\agent:      zunnel-agent -connect <this-host>:{d} -pubkey {s} -secret {s}
+            \\baked:      zig build -Drelease -Dtarget=<target> -Dagent-connect=<this-host>:{d} -Dagent-pubkey={s} -Dagent-secret={s}
+            \\
+        , .{ port, &pubkey, secret, port, &pubkey, secret });
+    } else {
+        std.debug.print(
+            \\agent:      zunnel-agent -connect <this-host>:{d} -pubkey {s}
+            \\WARNING: -no-secret: anyone who has the public key can connect as an agent
+            \\
+        , .{ port, &pubkey });
+    }
+    std.debug.print("type 'help' for commands\n", .{});
+    if (opts.config_file) |path| console.runConfig(path);
     console.run();
 }
 
@@ -178,8 +198,13 @@ fn shutdownWatcher() void {
 const help_text =
     \\  sessions                                   list connected agents
     \\  start [agent] [iface]                      route an interface through an agent
-    \\                                             (creates the interface if needed)
-    \\  stop [iface]                               detach the agent from an interface
+    \\                                             (creates it if needed, and binds it so it
+    \\                                             re-attaches whenever that agent reconnects)
+    \\  stop [iface]                               detach and unbind an interface
+    \\  bind <iface> <agent|ident>                 attach <iface> to that agent whenever it
+    \\                                             connects (works while it is offline)
+    \\  unbind <iface>                             remove a binding
+    \\  bindings                                   list bindings
     \\  ifaces                                     list tunnel interfaces and routes
     \\  iface add <name> [localhost-net]           create a tunnel interface
     \\  iface del <name>                           delete a tunnel interface
@@ -193,10 +218,14 @@ const help_text =
     \\  relay <agent> [bind]                       let deeper agents connect through
     \\                                             <agent> (default bind 0.0.0.0:11601)
     \\  kill <agent>                               shut an agent down for good (no reconnect)
+    \\  save [file]                                write interfaces, routes, bindings and
+    \\                                             listeners as commands (for -config)
     \\  exit                                       quit
     \\
     \\  [iface] defaults to the -tun name; [agent] defaults to the only agent.
     \\  <agent> is a session number or a unique prefix of the agent's IDENT.
+    \\  Listeners and bindings follow the agent's IDENT, so they come back when it
+    \\  reconnects; for an offline agent, give its full IDENT.
     \\
 ;
 
@@ -205,6 +234,8 @@ const Console = struct {
     server: *Server,
     /// -route values for the default interface, applied when it is created.
     pending_routes: std.ArrayList([]const u8) = .empty,
+    /// -config file; the default target of `save`.
+    config_path: ?[]const u8 = null,
 
     fn run(self: *Console) void {
         var buf: [1024]u8 = undefined;
@@ -253,6 +284,14 @@ const Console = struct {
             self.relay(at(args, 0), at(args, 1));
         } else if (eql(cmd, "kill")) {
             self.kill(at(args, 0));
+        } else if (eql(cmd, "bind")) {
+            self.bindCmd(args);
+        } else if (eql(cmd, "unbind")) {
+            self.unbind(at(args, 0));
+        } else if (eql(cmd, "bindings")) {
+            self.bindCmd(&.{});
+        } else if (eql(cmd, "save")) {
+            self.save(at(args, 0) orelse self.config_path orelse "zunnel.conf");
         } else if (eql(cmd, "exit") or eql(cmd, "quit")) {
             self.server.shutdown();
             std.process.exit(0);
@@ -364,16 +403,87 @@ const Console = struct {
         const s = self.resolveAgentLocked(agent_arg) orelse return;
         if (t.activeSession()) |prev| if (prev != s) std.debug.print("note: {s} was routed through agent #{d}\n", .{ name, prev.id });
         t.attach(s);
-        std.debug.print("tunnel {s} now routes through agent #{d} ({s}@{s})\n", .{ name, s.id, s.user, s.hostname });
+        self.server.setBindingLocked(name, s.ident) catch {};
+        std.debug.print("tunnel {s} now routes through agent #{d} ({s}@{s}); re-attaches when it reconnects\n", .{ name, s.id, s.user, s.hostname });
     }
 
     fn stop(self: *Console, name: []const u8) void {
         self.server.mutex.lock();
         defer self.server.mutex.unlock();
         const t = self.server.findTunnelLocked(name) orelse return std.debug.print("no interface '{s}'\n", .{name});
-        const s = t.activeSession() orelse return std.debug.print("{s} has no agent\n", .{name});
-        _ = t.detach(s);
-        std.debug.print("{s} stopped\n", .{name});
+        const unbound = self.server.removeBindingLocked(name);
+        if (t.activeSession()) |s| {
+            _ = t.detach(s);
+            std.debug.print("{s} stopped\n", .{name});
+        } else if (unbound) {
+            std.debug.print("{s} unbound\n", .{name});
+        } else std.debug.print("{s} has no agent\n", .{name});
+    }
+
+    /// Finds a connected agent by session number or unique IDENT prefix,
+    /// without printing anything. Caller holds server.mutex.
+    fn findAgentLocked(self: *Console, arg: []const u8) ?*Session {
+        if (std.fmt.parseInt(u32, std.mem.trimLeft(u8, arg, "#"), 10)) |id| {
+            if (self.server.findSessionLocked(id)) |s| return s;
+        } else |_| {}
+        var found: ?*Session = null;
+        for (self.server.sessions.items) |s| {
+            if (!std.mem.startsWith(u8, s.ident, arg)) continue;
+            if (found != null) return null;
+            found = s;
+        }
+        return found;
+    }
+
+    /// Resolves an <agent|ident> argument to an identity, copied into `buf`:
+    /// a connected agent's IDENT, or the argument itself taken as the full
+    /// IDENT of an agent that is offline. Caller holds server.mutex.
+    fn resolveIdentLocked(self: *Console, arg: ?[]const u8, buf: []u8) ?[]const u8 {
+        const s = if (arg) |a| self.findAgentLocked(a) else self.resolveAgentLocked(null);
+        const ident = if (s) |x| x.ident else blk: {
+            const a = arg orelse return null;
+            if (std.fmt.parseInt(u32, std.mem.trimLeft(u8, a, "#"), 10)) |_| {
+                std.debug.print("no agent #{s}\n", .{std.mem.trimLeft(u8, a, "#")});
+                return null;
+            } else |_| {}
+            std.debug.print("no connected agent matches '{s}'; treating it as the IDENT of an offline agent\n", .{a});
+            break :blk a;
+        };
+        if (ident.len > buf.len) return null;
+        @memcpy(buf[0..ident.len], ident);
+        return buf[0..ident.len];
+    }
+
+    fn bindCmd(self: *Console, args: []const []const u8) void {
+        self.server.mutex.lock();
+        defer self.server.mutex.unlock();
+        if (args.len == 0) {
+            if (self.server.bindings.items.len == 0) return std.debug.print("no bindings\n", .{});
+            for (self.server.bindings.items) |b| {
+                const t = self.server.findTunnelLocked(b.iface);
+                const state = if (t == null) "(no such interface)" else if (t.?.activeSession() != null) "(attached)" else "(waiting for agent)";
+                std.debug.print("  {s:<12} -> {s}  {s}\n", .{ b.iface, b.ident, state });
+            }
+            return;
+        }
+        if (args.len < 2) return std.debug.print("usage: bind <iface> <agent|ident>\n", .{});
+        var buf: [64]u8 = undefined;
+        const ident = self.resolveIdentLocked(args[1], &buf) orelse return;
+        self.server.setBindingLocked(args[0], ident) catch |err| return std.debug.print("bind failed: {s}\n", .{@errorName(err)});
+        if (self.server.attachBoundLocked(args[0], ident)) |s| {
+            std.debug.print("{s} bound to {s}; now routes through agent #{d}\n", .{ args[0], ident, s.id });
+        } else if (self.server.findTunnelLocked(args[0]) == null) {
+            std.debug.print("{s} bound to {s} (create it with 'iface add {s}')\n", .{ args[0], ident, args[0] });
+        } else std.debug.print("{s} bound to {s}; attaches when that agent connects\n", .{ args[0], ident });
+    }
+
+    fn unbind(self: *Console, iface_arg: ?[]const u8) void {
+        const name = iface_arg orelse return std.debug.print("usage: unbind <iface>\n", .{});
+        self.server.mutex.lock();
+        defer self.server.mutex.unlock();
+        if (self.server.removeBindingLocked(name)) {
+            std.debug.print("{s} unbound (still attached until 'stop {s}')\n", .{ name, name });
+        } else std.debug.print("{s} has no binding\n", .{name});
     }
 
     fn listIfaces(self: *Console) void {
@@ -401,6 +511,9 @@ const Console = struct {
             _ = self.createTunnel(args[1], net);
         } else if (eql(args[0], "del")) {
             self.server.deleteTunnel(args[1]) catch |err| return std.debug.print("iface del failed: {s}\n", .{@errorName(err)});
+            self.server.mutex.lock();
+            _ = self.server.removeBindingLocked(args[1]);
+            self.server.mutex.unlock();
             std.debug.print("deleted {s}\n", .{args[1]});
         } else std.debug.print(usage_line, .{});
     }
@@ -470,16 +583,19 @@ const Console = struct {
     }
 
     fn addListener(self: *Console, agent_arg: ?[]const u8, transport: common.proto.Transport, bind: std.net.Address, target: std.net.Address, is_relay: bool) bool {
-        const agent_id = blk: {
+        var buf: [64]u8 = undefined;
+        const ident = blk: {
             self.server.mutex.lock();
             defer self.server.mutex.unlock();
-            break :blk (self.resolveAgentLocked(agent_arg) orelse return false).id;
+            break :blk self.resolveIdentLocked(agent_arg, &buf) orelse return false;
         };
-        const id = self.server.addListener(agent_id, transport, bind, target, is_relay) catch |err| {
+        const added = self.server.addListener(ident, transport, bind, target, is_relay) catch |err| {
             std.debug.print("listener add failed: {s}\n", .{@errorName(err)});
             return false;
         };
-        std.debug.print("listener #{d} requested on agent #{d}\n", .{ id, agent_id });
+        if (added.started_on) |sid| {
+            std.debug.print("listener #{d} requested on agent #{d}\n", .{ added.id, sid });
+        } else std.debug.print("listener #{d} registered; starts when agent {s} connects\n", .{ added.id, ident });
         return true;
     }
 
@@ -489,15 +605,67 @@ const Console = struct {
         defer server.mutex.unlock();
         if (server.listeners.items.len == 0) return std.debug.print("no listeners\n", .{});
         for (server.listeners.items) |l| {
-            std.debug.print("  #{d:<3} agent #{d:<3} {s} {f} -> {f}{s}{s}\n", .{
+            var where_buf: [32]u8 = undefined;
+            const where = if (l.session) |s| std.fmt.bufPrint(&where_buf, "agent #{d}", .{s.id}) catch "?" else "offline";
+            std.debug.print("  #{d:<3} {s} ({s}) {s} {f} -> {f}{s}{s}\n", .{
                 l.id,
-                l.session.id,
+                l.ident,
+                where,
                 @tagName(l.transport),
                 l.bind,
                 l.target,
                 if (l.is_relay) "  (relay)" else "",
-                if (l.active) "" else "  (pending)",
+                if (l.active) "" else if (l.session != null) "  (pending)" else "  (waiting for agent)",
             });
+        }
+    }
+
+    // --------------------------------------------------------- config file
+
+    /// Runs each line of `path` as a console command (blank lines and `#`
+    /// comments are skipped). Errors are reported and do not stop the script.
+    fn runConfig(self: *Console, path: []const u8) void {
+        const data = std.fs.cwd().readFileAlloc(self.gpa, path, 1024 * 1024) catch |err| {
+            std.debug.print("cannot read config '{s}': {s}\n", .{ path, @errorName(err) });
+            return;
+        };
+        defer self.gpa.free(data);
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        var n: usize = 0;
+        while (lines.next()) |raw| {
+            n += 1;
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            std.debug.print("{s}:{d}> {s}\n", .{ path, n, line });
+            self.exec(line);
+        }
+    }
+
+    /// Writes the current setup as console commands that `-config` replays.
+    fn save(self: *Console, path: []const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        self.writeConfig(&out.writer) catch return std.debug.print("save failed: out of memory\n", .{});
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.written() }) catch |err|
+            return std.debug.print("cannot write '{s}': {s}\n", .{ path, @errorName(err) });
+        std.debug.print("saved to {s} (replay with -config {s})\n", .{ path, path });
+    }
+
+    fn writeConfig(self: *Console, w: *std.Io.Writer) !void {
+        const server = self.server;
+        server.mutex.lock();
+        defer server.mutex.unlock();
+        try w.writeAll("# zunnel proxy configuration, written by `save`; load with -config <file>\n");
+        for (server.tunnels.items) |t| {
+            try w.print("iface add {s} {f}\n", .{ t.name, t.localhost_net });
+            for (t.routes.items) |r| try w.print("route add {s} {s}\n", .{ r, t.name });
+        }
+        for (self.pending_routes.items) |r| try w.print("route add {s} {s}\n", .{ r, server.default_iface });
+        for (server.bindings.items) |b| try w.print("bind {s} {s}\n", .{ b.iface, b.ident });
+        for (server.listeners.items) |l| {
+            if (l.is_relay) {
+                try w.print("relay {s} {f}\n", .{ l.ident, l.bind });
+            } else try w.print("listener add {s} {s} {f} {f}\n", .{ l.ident, @tagName(l.transport), l.bind, l.target });
         }
     }
 

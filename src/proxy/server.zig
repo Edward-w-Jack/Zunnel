@@ -54,14 +54,27 @@ pub const Session = struct {
     }
 };
 
+/// A listener belongs to an agent identity, not a connection: it is
+/// (re)started whenever an agent with that identity connects.
 pub const Listener = struct {
     id: u32,
-    session: *Session,
+    /// Agent identity (owned).
+    ident: []const u8,
     transport: proto.Transport,
     bind: std.net.Address,
     target: std.net.Address,
+    /// The session currently running it; null while that agent is offline.
+    session: ?*Session = null,
+    /// The agent confirmed the listener is open.
     active: bool = false,
     is_relay: bool = false,
+};
+
+/// Interface `iface` follows the agent with identity `ident`: whenever that
+/// agent connects, the interface is attached to it (if it is free).
+pub const Binding = struct {
+    iface: []const u8, // owned
+    ident: []const u8, // owned
 };
 
 pub const Server = struct {
@@ -76,6 +89,8 @@ pub const Server = struct {
     dial_timeout_ms: u16 = proto.default_dial_timeout_ms,
     /// Max TCP dials in flight per tunnel; further SYNs wait in a queue.
     max_dials: u32 = 256,
+    /// Agents connect without a shared secret (warned about on every join).
+    no_secret: bool = false,
 
     /// Guards everything below. Lock order: Server.mutex -> netstack.lock.
     mutex: std.Thread.Mutex = .{},
@@ -84,6 +99,7 @@ pub const Server = struct {
     tunnels: std.ArrayList(*Tunnel) = .empty,
     listeners: std.ArrayList(Listener) = .empty,
     next_listener_id: u32 = 1,
+    bindings: std.ArrayList(Binding) = .empty,
     /// Local port of a relay dial into our own listener -> upstream session id.
     relay_ports: std.AutoHashMapUnmanaged(u16, u32) = .empty,
     /// Handshakes in progress, total and per source address.
@@ -185,7 +201,9 @@ pub const Server = struct {
         s.relay.on_dialed = .{ .ctx = s, .func = onRelayDialed };
         s.parseHello();
 
-        var attached: ?*Tunnel = null;
+        var attached: std.ArrayList([]const u8) = .empty;
+        defer attached.deinit(self.gpa);
+        var restarted: usize = 0;
         var covered_buf: [64]u8 = undefined;
         var covered: ?[]const u8 = null;
         {
@@ -204,17 +222,30 @@ pub const Server = struct {
                     break;
                 };
             }
-            if (self.autostart) {
-                if (self.findTunnelLocked(self.default_iface)) |t| if (t.activeSession() == null) {
-                    t.attach(s);
-                    attached = t;
-                };
+            // -autostart: the default interface follows the first agent that joins.
+            if (self.autostart and self.findBindingLocked(self.default_iface) == null) {
+                self.setBindingLocked(self.default_iface, s.ident) catch {};
+            }
+            // Re-attach every interface bound to this agent's identity.
+            for (self.bindings.items) |b| {
+                if (!std.mem.eql(u8, b.ident, s.ident)) continue;
+                const t = self.findTunnelLocked(b.iface) orelse continue;
+                if (t.activeSession() != null) continue;
+                t.attach(s);
+                attached.append(self.gpa, t.name) catch {};
+            }
+            // Restart this identity's listeners.
+            for (self.listeners.items) |*l| {
+                if (l.session != null or !std.mem.eql(u8, l.ident, s.ident)) continue;
+                if (startListenerLocked(l, s)) restarted += 1;
             }
         }
         var via_buf: [32]u8 = undefined;
         const via = if (s.via) |v| std.fmt.bufPrint(&via_buf, " via agent #{d}", .{v}) catch "" else "";
-        std.debug.print("\n[+] agent #{d} joined: {s}@{s} ({s}/{s}) from {f}{s}\n", .{ s.id, s.user, s.hostname, s.os, s.arch, s.remote, via });
-        if (attached) |t| std.debug.print("[*] tunnel {s} now routes through agent #{d}\n", .{ t.name, s.id });
+        std.debug.print("\n[+] agent #{d} joined: {s}@{s} ({s}/{s}) id {s} from {f}{s}\n", .{ s.id, s.user, s.hostname, s.os, s.arch, s.ident, s.remote, via });
+        for (attached.items) |name| std.debug.print("[*] tunnel {s} now routes through agent #{d}\n", .{ name, s.id });
+        if (restarted > 0) std.debug.print("[*] restarting {d} listener(s) on agent #{d}\n", .{ restarted, s.id });
+        if (self.no_secret) std.debug.print("[!] warning: running with -no-secret; anyone with the public key can join\n", .{});
         if (covered) |r| std.debug.print("[!] warning: route {s} covers agent #{d}'s address; its link may break. Remove that route.\n", .{ r, s.id });
 
         while (true) {
@@ -234,11 +265,12 @@ pub const Server = struct {
                 break;
             };
             for (self.tunnels.items) |t| if (t.detach(s)) stopped.append(self.gpa, t.name) catch {};
-            var i: usize = 0;
-            while (i < self.listeners.items.len) {
-                if (self.listeners.items[i].session == s) _ = self.listeners.orderedRemove(i) else i += 1;
-            }
-            for (stopped.items) |name| std.debug.print("\n[!] tunnel {s} stopped: its agent disconnected\n", .{name});
+            // Listeners stay registered and restart when the agent comes back.
+            for (self.listeners.items) |*l| if (l.session == s) {
+                l.session = null;
+                l.active = false;
+            };
+            for (stopped.items) |name| std.debug.print("\n[!] tunnel {s} stopped: its agent disconnected (re-attaches when it reconnects)\n", .{name});
         }
         std.debug.print("\n[-] agent #{d} ({s}@{s}) left\n", .{ s.id, s.user, s.hostname });
 
@@ -273,14 +305,16 @@ pub const Server = struct {
     fn onListenerReply(self: *Server, s: *Session, frame: common.link.Frame) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.listeners.items, 0..) |*l, i| {
+        for (self.listeners.items) |*l| {
             if (l.id != frame.id or l.session != s) continue;
             if (frame.type == .listener_ok) {
                 l.active = true;
                 std.debug.print("\n[*] listener #{d} active: agent #{d} {s} {f} -> {f}\n", .{ l.id, s.id, @tagName(l.transport), l.bind, l.target });
             } else {
-                std.debug.print("\n[!] listener #{d} failed on agent #{d}: {s}\n", .{ l.id, s.id, frame.payload });
-                _ = self.listeners.orderedRemove(i);
+                // Keep the record: it is retried the next time the agent connects.
+                std.debug.print("\n[!] listener #{d} failed on agent #{d}: {s} (retried on reconnect; 'listener del {d}' removes it)\n", .{ l.id, s.id, frame.payload, l.id });
+                l.session = null;
+                l.active = false;
             }
             return;
         }
@@ -397,33 +431,93 @@ pub const Server = struct {
         return null;
     }
 
-    /// Asks agent `session_id` to open a listener. Returns the listener id.
-    pub fn addListener(self: *Server, session_id: u32, transport: proto.Transport, bind: std.net.Address, target: std.net.Address, is_relay: bool) !u32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const s = self.findSessionLocked(session_id) orelse return error.NoSuchAgent;
-        const id = self.next_listener_id;
-        try self.listeners.append(self.gpa, .{ .id = id, .session = s, .transport = transport, .bind = bind, .target = target, .is_relay = is_relay });
-        self.next_listener_id += 1;
+    /// Asks `s` to open listener `l`. Caller holds `mutex`.
+    fn startListenerLocked(l: *Listener, s: *Session) bool {
         var storage: [16]u8 = undefined;
         var buf: [proto.Endpoint.max_len]u8 = undefined;
-        const ep = proto.addressEndpoint(transport, bind, &storage);
-        s.link.send(.listener_add, id, ep.encode(&buf)) catch {
-            _ = self.listeners.pop();
-            return error.AgentGone;
-        };
-        return id;
+        const ep = proto.addressEndpoint(l.transport, l.bind, &storage);
+        s.link.send(.listener_add, l.id, ep.encode(&buf)) catch return false;
+        l.session = s;
+        l.active = false;
+        return true;
+    }
+
+    pub const AddedListener = struct { id: u32, started_on: ?u32 };
+
+    /// Registers a listener for agent identity `ident`. It starts right away
+    /// on a connected agent with that identity, otherwise when one connects.
+    pub fn addListener(self: *Server, ident: []const u8, transport: proto.Transport, bind: std.net.Address, target: std.net.Address, is_relay: bool) !AddedListener {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owned = try self.gpa.dupe(u8, ident);
+        errdefer self.gpa.free(owned);
+        const id = self.next_listener_id;
+        try self.listeners.append(self.gpa, .{ .id = id, .ident = owned, .transport = transport, .bind = bind, .target = target, .is_relay = is_relay });
+        self.next_listener_id += 1;
+        const l = &self.listeners.items[self.listeners.items.len - 1];
+        for (self.sessions.items) |s| {
+            if (!std.mem.eql(u8, s.ident, ident)) continue;
+            if (startListenerLocked(l, s)) return .{ .id = id, .started_on = s.id };
+        }
+        return .{ .id = id, .started_on = null };
     }
 
     pub fn deleteListener(self: *Server, id: u32) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.listeners.items, 0..) |l, i| if (l.id == id) {
-            l.session.link.send(.listener_del, id, &.{}) catch {};
+            if (l.session) |s| s.link.send(.listener_del, id, &.{}) catch {};
+            self.gpa.free(l.ident);
             _ = self.listeners.orderedRemove(i);
             return;
         };
         return error.NoSuchListener;
+    }
+
+    // ----------------------------------------------------------- bindings
+
+    /// Caller holds `mutex`.
+    pub fn findBindingLocked(self: *Server, iface: []const u8) ?*Binding {
+        for (self.bindings.items) |*b| if (std.mem.eql(u8, b.iface, iface)) return b;
+        return null;
+    }
+
+    /// Makes `iface` follow agent identity `ident` (replacing any previous
+    /// binding). Caller holds `mutex`.
+    pub fn setBindingLocked(self: *Server, iface: []const u8, ident: []const u8) !void {
+        const new_ident = try self.gpa.dupe(u8, ident);
+        if (self.findBindingLocked(iface)) |b| {
+            self.gpa.free(b.ident);
+            b.ident = new_ident;
+            return;
+        }
+        errdefer self.gpa.free(new_ident);
+        const new_iface = try self.gpa.dupe(u8, iface);
+        errdefer self.gpa.free(new_iface);
+        try self.bindings.append(self.gpa, .{ .iface = new_iface, .ident = new_ident });
+    }
+
+    /// Removes the binding of `iface`, if any. Caller holds `mutex`.
+    pub fn removeBindingLocked(self: *Server, iface: []const u8) bool {
+        for (self.bindings.items, 0..) |b, i| if (std.mem.eql(u8, b.iface, iface)) {
+            self.gpa.free(b.iface);
+            self.gpa.free(b.ident);
+            _ = self.bindings.orderedRemove(i);
+            return true;
+        };
+        return false;
+    }
+
+    /// Attaches `iface` to a connected agent with identity `ident`, if the
+    /// interface exists and is idle. Returns that agent. Caller holds `mutex`.
+    pub fn attachBoundLocked(self: *Server, iface: []const u8, ident: []const u8) ?*Session {
+        const t = self.findTunnelLocked(iface) orelse return null;
+        if (t.activeSession() != null) return null;
+        for (self.sessions.items) |s| if (std.mem.eql(u8, s.ident, ident)) {
+            t.attach(s);
+            return s;
+        };
+        return null;
     }
 };
 
