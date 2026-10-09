@@ -42,13 +42,33 @@ with no SOCKS and no proxychains.
 Requires Zig 0.15.2.
 
 ```sh
-zig build -Doptimize=ReleaseSmall                                  # host
-zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-linux-musl       # static Linux binaries
-zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows          # Windows binaries
+zig build -Doptimize=ReleaseSafe                                   # host
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl        # static Linux binaries
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows           # Windows binaries
 zig build test                                                     # unit tests
 ```
 
 Binaries go to `zig-out/bin/` (use `--prefix zig-out/<name>` to keep per-target builds apart).
+Use `ReleaseSafe` for real use. Both binaries parse untrusted network input, and `ReleaseSmall`
+/ `ReleaseFast` remove the bounds and overflow checks that turn parser bugs into clean crashes
+instead of memory corruption.
+
+## Privileges
+
+| | Proxy (operator machine) | Agent (target) |
+|---|---|---|
+| Needs root / Administrator | **Yes**: it creates the TUN interface | **No, never** |
+| Needs `wintun.dll` | Yes, on Windows | **No** |
+| Files to deploy | `zunnel-proxy` (+ `wintun.dll` on Windows) | the single `zunnel-agent` binary |
+
+The proxy always runs elevated with a TUN. The agent is a multiplexer that turns proxy requests
+into ordinary socket calls (`connect`, `send`, `recv`), so it works as any normal user. Without
+privileges, the agent has these limits:
+
+- Listeners on ports below 1024 need root or `CAP_NET_BIND_SERVICE` on Linux/macOS (Windows has no such restriction).
+- Ping on Linux uses unprivileged ICMP sockets when `net.ipv4.ping_group_range` allows it (the
+  default on Fedora and Ubuntu), otherwise it falls back to the system `ping` binary. Windows
+  uses `IcmpSendEcho`, which needs no rights.
 
 ## Usage
 
@@ -108,12 +128,82 @@ send to `240.0.0.0/4`, so on Windows pick another network to reach the agent's l
 zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -route 10.10.0.0/16
 ```
 
-## Status / TODO
+## Scanning through the tunnel
 
-- [ ] IPv6 (lwIP is built IPv4-only for now)
-- [ ] Agent interface listing (`ifconfig` in the console)
-- [ ] Dial timeouts on the agent
+The agent has no privileges, so it can't send raw packets. Every probe becomes a real `connect()`
+from the agent host:
+
+- `-sT`, `-sS`, `-sV` and NSE work. `-sS` behaves like `-sT`: open ports report correctly, and
+  the target sees a full TCP connection from the agent for each one.
+- Host discovery: use `-PE` (ICMP echo is supported) or `-Pn`. Until the stray-ACK fix below
+  lands, nmap's default discovery reports every address as up.
+- Not possible through any unprivileged pivot: `-sA/-sF/-sN/-sX/-sW`, `-O`, `--traceroute`.
+
+Recommended for now: `nmap -sT -PE -T4 --max-retries 1 <targets>`.
+
+## Done
+
+- [x] TCP/UDP tunnelling through lwIP, with SYNs held until the agent's dial succeeds
 - [x] ICMP echo through the agent
 - [x] Listeners (TCP + UDP)
 - [x] Multiple simultaneous tunnels
 - [x] Multi-hop relays
+
+## Roadmap
+
+### P0: reliability and safety (before real engagements)
+- [ ] **Link heartbeat.** Ping every 10 s and drop the session after 3 misses, on both sides.
+  Today only OS TCP keepalive (~2 h) notices a dead link, so NAT timeouts leave zombie sessions
+  and `-retry` agents never reconnect.
+- [ ] **Agent dial timeout and concurrency cap.** Non-blocking connect with a 5 s default, a
+  limit on dials in flight, and a cap on dialing flows per tunnel on the proxy. Today a dial
+  blocks ~21 s (Windows) or ~2 min (Linux) on its own thread, so scanning firewalled hosts can
+  spawn thousands of threads.
+- [ ] **Bounded handshakes.** Limit concurrent handshakes, shorten the 15 s timeout, and rate-limit
+  accepts per source IP. Every inbound connection currently gets its own thread.
+- [ ] **Route self-capture guard.** Refuse (or require `force`) a `route add` that covers an
+  agent's own link address, which would silently kill the session.
+- [ ] **Fuzzing.** Fuzz `Link.recvFrame`, the `proto.*.decode` functions and `packet.parse*` with
+  `std.testing.fuzz`.
+- [ ] **Graceful shutdown.** On Ctrl-C/SIGTERM, remove routes, close adapters and tell agents.
+- [ ] **Startup checks.** Fail fast if the proxy is not root/Administrator, or `wintun.dll` is
+  missing on Windows, instead of failing at the first `start`.
+
+### P0: behave like a normal VPN (scan accuracy)
+Tools should behave as if the operator were on a VPN inside the target network.
+- [ ] **Drop stray TCP packets** that match no flow (non-SYN, unknown tuple) instead of passing
+  them to lwIP. lwIP answers them with a RST, which makes nmap's default ACK probe report every
+  IP as up.
+- [ ] **Accurate failure signals.** When the agent's dial is refused, reply with RST (as now).
+  When it times out or has no route, reply with ICMP destination-unreachable (or silence), so
+  nmap reports *filtered* or *down* instead of *closed*.
+- [ ] **UDP closed ports.** The agent reports `ECONNREFUSED`/`WSAECONNRESET` on UDP flows, and the
+  proxy synthesises ICMP port-unreachable so `-sU` and other UDP tools see closed ports.
+- [ ] The dial timeout and concurrency cap above, so large scans stay fast and bounded.
+
+### P1: operations
+- [ ] **Stable agent identity.** A reconnecting agent automatically gets back its interfaces, routes and listeners.
+- [ ] **Agent config without arguments.** Bake in the connect address, key and secret at build
+  time (`-Dconnect=… -Dpubkey=… -Dsecret=…`) or read them from the environment, so secrets don't
+  show up in process listings.
+- [ ] Make `-secret` mandatory by default, and warn loudly when it is disabled.
+- [ ] Agent `ifconfig` (interfaces and addresses in the hello) and `session info <id>`.
+- [ ] `flows [iface]` command, plus per-tunnel and per-agent byte and flow counters.
+- [ ] Timestamped logging, `-log <file>`, `-v`/`-q`, and an event log (joins, leaves, routes, listeners).
+- [ ] Proxy config file: interfaces, routes and listeners restored on startup.
+- [ ] `kill <agent>`, and an optional agent `-expire <time>` for engagement windows.
+- [ ] Console line editing, history and tab completion.
+
+### P2: transports and evasion
+- [ ] Alternate transports: TLS (looks like HTTPS) and WebSocket. Agent support for HTTP CONNECT
+  proxies, with auto-detection on Windows.
+- [ ] A less distinctive handshake: no cleartext magic, optional random padding, fixed-size records.
+- [ ] Windows agent built without a console window; optional run-as-service.
+
+### P3: protocol coverage and scale
+- [ ] IPv6 (lwIP dual stack, IPv6 routes on the TUN).
+- [ ] IP fragment reassembly and UDP datagrams over 16 KiB, which are currently dropped.
+- [ ] Event-driven agent (epoll/kqueue/IOCP) instead of thread-per-flow, for very large scans.
+- [ ] macOS proxy (utun).
+- [ ] In-repo integration lab (`lab.sh` with network namespaces) and CI cross-compiling Linux,
+  Windows and macOS.
