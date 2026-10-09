@@ -209,7 +209,7 @@ translates the result back into packets:
 - [ ] **Stable agent identity.** A reconnecting agent automatically gets back its interfaces, routes and listeners.
 - [ ] **Agent config without arguments.** Bake in the connect address, key and secret at build
   time (`-Dconnect=… -Dpubkey=… -Dsecret=…`) or read them from the environment, so secrets don't
-  show up in process listings.
+  show up in process listings. Prerequisite for the agent DLL build (P2).
 - [ ] Make `-secret` mandatory by default, and warn loudly when it is disabled.
 - [ ] Agent `ifconfig` (interfaces and addresses in the hello) and `session info <id>`.
 - [ ] `flows [iface]` command, plus per-tunnel and per-agent byte and flow counters.
@@ -224,6 +224,11 @@ translates the result back into packets:
   proxies, with auto-detection on Windows.
 - [ ] A less distinctive handshake: no cleartext magic, optional random padding, fixed-size records.
 - [ ] Windows agent built without a console window; optional run-as-service.
+- [ ] **Agent DLL build target** (`zig build -Dagent-dll`) for reflective DLL loading: the agent
+  as a Windows DLL (x86_64 and x86) with an exported entry point that starts the agent on its own
+  thread and returns immediately. A DLL can't take command-line arguments, so it requires the
+  baked-in agent config (P1). It must also be safe to run inside a host process: no console
+  output, no `exit` on errors, and it reconnects (`-retry` behaviour) by default.
 
 ### P3: protocol coverage and scale
 - [ ] IPv6 (lwIP dual stack, IPv6 routes on the TUN).
