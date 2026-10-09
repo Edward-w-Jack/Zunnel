@@ -135,4 +135,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = common })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = proxy_mod })).step);
+
+    // Zig 0.15's fuzzer cannot instrument the proxy test binary (it links libc
+    // and lwIP), so fuzzing gets its own step with only pure-Zig parsers:
+    // `zig build fuzz --fuzz` (Linux). Without --fuzz it runs the tests once.
+    const packet_mod = b.createModule(.{
+        .root_source_file = b.path("src/proxy/packet.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fuzz_step = b.step("fuzz", "Fuzz the untrusted-input parsers (use with --fuzz, Linux only)");
+    fuzz_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = common })).step);
+    fuzz_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = packet_mod })).step);
 }

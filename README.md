@@ -46,14 +46,16 @@ zig build -Drelease                                                      # host 
 zig build -Drelease -Dtarget=x86_64-linux-musl --prefix zig-out/linux    # static Linux binaries
 zig build -Drelease -Dtarget=x86_64-windows --prefix zig-out/windows     # Windows binaries
 zig build test                                                           # unit + fuzz-corpus tests
-zig build test --fuzz                                                    # coverage-guided fuzzing (Linux only)
+zig build fuzz --fuzz                                                    # coverage-guided fuzzing (Linux; see below)
 ```
 
 Binaries go to `zig-out/bin/` (use `--prefix zig-out/<name>` to keep per-target builds apart).
 `-Drelease` builds `ReleaseSafe`. Both binaries parse untrusted network input, and `ReleaseSmall`
 / `ReleaseFast` remove the bounds and overflow checks that turn parser bugs into clean crashes
 instead of memory corruption. The frame parser, message decoders, packet parsers and handshake
-reader all have fuzz tests.
+reader all have fuzz tests. Fuzzing has its own step because Zig 0.15's experimental fuzzer
+can't instrument the proxy test binary (it links libc and lwIP); `zig build fuzz` builds only the
+pure-Zig parsers. Run it as a normal user, not with `sudo`.
 
 ## Privileges
 
