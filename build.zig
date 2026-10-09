@@ -60,16 +60,27 @@ pub fn build(b: *std.Build) void {
     });
 
     // ---------------------------------------------------------------- agent
-    const agent = b.addExecutable(.{
-        .name = "zunnel-agent",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/agent/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .imports = &.{.{ .name = "common", .module = common }},
-        }),
+    // Settings baked into the agent so it runs without arguments. Flags and
+    // ZUNNEL_* environment variables still override them.
+    const agent_opts = b.addOptions();
+    agent_opts.addOption(?[]const u8, "connect", b.option([]const u8, "agent-connect", "Bake in the proxy address (host:port)"));
+    agent_opts.addOption(?[]const u8, "pubkey", b.option([]const u8, "agent-pubkey", "Bake in the proxy public key"));
+    agent_opts.addOption(?[]const u8, "secret", b.option([]const u8, "agent-secret", "Bake in the shared secret"));
+    agent_opts.addOption(?[]const u8, "expire", b.option([]const u8, "agent-expire", "Bake in an expiry (UTC time or duration)"));
+    agent_opts.addOption(?[]const u8, "id", b.option([]const u8, "agent-id", "Bake in an agent id (default: derived from the host)"));
+    agent_opts.addOption(?bool, "retry", b.option(bool, "agent-retry", "Reconnect forever (default: on when -Dagent-connect is set)"));
+
+    const agent_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .imports = &.{
+            .{ .name = "common", .module = common },
+            .{ .name = "agent_options", .module = agent_opts.createModule() },
+        },
     });
+    const agent = b.addExecutable(.{ .name = "zunnel-agent", .root_module = agent_mod });
     b.installArtifact(agent);
 
     // ----------------------------------------------------------------- lwIP
@@ -135,6 +146,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = common })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = proxy_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = agent_mod })).step);
 
     // Zig 0.15's fuzzer cannot instrument the proxy test binary (it links libc
     // and lwIP), so fuzzing gets its own step with only pure-Zig parsers:

@@ -9,7 +9,7 @@
 const std = @import("std");
 
 /// Bump the digit whenever the handshake or framing changes incompatibly.
-pub const magic = "ZNL4";
+pub const magic = "ZNL5";
 pub const default_port: u16 = 11601;
 /// Both ends send a ping this often...
 pub const heartbeat_interval_ms = 10_000;
@@ -60,6 +60,12 @@ pub const FrameType = enum(u8) {
     /// agent -> proxy: the target answered a UDP flow with ICMP unreachable
     /// (payload: ICMP code u8, 3 = port unreachable). The flow stays open.
     icmp_unreachable = 17,
+    /// proxy -> agent: shut down for good (no reconnect)
+    kill = 18,
+    /// proxy -> agent: request host information (id = request id)
+    info_request = 19,
+    /// agent -> proxy: host information as `key=value` lines
+    info_reply = 20,
     _,
 };
 
