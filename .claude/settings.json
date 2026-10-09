@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zig build:*)",
+      "Bash(zig fetch:*)",
+      "Bash(zig build-exe:*)",
+      "Bash(zig version)",
+      "Bash(zig env)",
+      "Bash(git:*)"
+    ]
+  }
+}

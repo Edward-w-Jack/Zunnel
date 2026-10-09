@@ -1,0 +1,185 @@
+//! Minimal IPv4/TCP/UDP parsing and packet construction for traffic that does
+//! not go through lwIP (UDP, connection-refused RSTs).
+const std = @import("std");
+
+pub const proto_icmp = 1;
+pub const proto_tcp = 6;
+pub const proto_udp = 17;
+
+pub const tcp_fin = 0x01;
+pub const tcp_syn = 0x02;
+pub const tcp_rst = 0x04;
+pub const tcp_ack = 0x10;
+
+pub const Ip4 = struct {
+    src: [4]u8,
+    dst: [4]u8,
+    proto: u8,
+    /// Transport header + payload.
+    payload: []const u8,
+};
+
+pub fn parseIp4(pkt: []const u8) ?Ip4 {
+    if (pkt.len < 20 or pkt[0] >> 4 != 4) return null;
+    const ihl = @as(usize, pkt[0] & 0x0f) * 4;
+    const total = std.mem.readInt(u16, pkt[2..4], .big);
+    if (ihl < 20 or total < ihl or total > pkt.len) return null;
+    // Fragments are not supported (MF set or non-zero offset).
+    const frag = std.mem.readInt(u16, pkt[6..8], .big);
+    if (frag & 0x3fff != 0) return null;
+    return .{
+        .src = pkt[12..16].*,
+        .dst = pkt[16..20].*,
+        .proto = pkt[9],
+        .payload = pkt[ihl..total],
+    };
+}
+
+pub const Tcp = struct {
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    flags: u8,
+};
+
+pub fn parseTcp(seg: []const u8) ?Tcp {
+    if (seg.len < 20) return null;
+    return .{
+        .sport = std.mem.readInt(u16, seg[0..2], .big),
+        .dport = std.mem.readInt(u16, seg[2..4], .big),
+        .seq = std.mem.readInt(u32, seg[4..8], .big),
+        .flags = seg[13],
+    };
+}
+
+pub const Udp = struct {
+    sport: u16,
+    dport: u16,
+    data: []const u8,
+};
+
+pub fn parseUdp(dgram: []const u8) ?Udp {
+    if (dgram.len < 8) return null;
+    const len = std.mem.readInt(u16, dgram[4..6], .big);
+    if (len < 8 or len > dgram.len) return null;
+    return .{
+        .sport = std.mem.readInt(u16, dgram[0..2], .big),
+        .dport = std.mem.readInt(u16, dgram[2..4], .big),
+        .data = dgram[8..len],
+    };
+}
+
+fn sum16(data: []const u8, initial: u32) u32 {
+    var s = initial;
+    var i: usize = 0;
+    while (i + 1 < data.len) : (i += 2) s += std.mem.readInt(u16, data[i..][0..2], .big);
+    if (data.len & 1 == 1) s += @as(u32, data[data.len - 1]) << 8;
+    return s;
+}
+
+fn fold(s0: u32) u16 {
+    var s = s0;
+    while (s >> 16 != 0) s = (s & 0xffff) + (s >> 16);
+    return ~@as(u16, @truncate(s));
+}
+
+fn pseudoSum(src: [4]u8, dst: [4]u8, proto: u8, len: usize) u32 {
+    var s = sum16(&src, 0);
+    s = sum16(&dst, s);
+    return s + proto + @as(u32, @intCast(len));
+}
+
+fn writeIp4Header(buf: []u8, src: [4]u8, dst: [4]u8, proto: u8, total: usize) void {
+    buf[0] = 0x45;
+    buf[1] = 0;
+    std.mem.writeInt(u16, buf[2..4], @intCast(total), .big);
+    std.mem.writeInt(u16, buf[4..6], 0, .big); // id
+    std.mem.writeInt(u16, buf[6..8], 0x4000, .big); // DF
+    buf[8] = 64; // TTL
+    buf[9] = proto;
+    std.mem.writeInt(u16, buf[10..12], 0, .big);
+    buf[12..16].* = src;
+    buf[16..20].* = dst;
+    std.mem.writeInt(u16, buf[10..12], fold(sum16(buf[0..20], 0)), .big);
+}
+
+/// Builds an IPv4/UDP packet into `buf`. Returns null if it does not fit.
+pub fn buildUdp4(buf: []u8, src: [4]u8, sport: u16, dst: [4]u8, dport: u16, data: []const u8) ?[]u8 {
+    const total = 20 + 8 + data.len;
+    if (total > buf.len or total > 0xffff) return null;
+    const udp = buf[20..total];
+    std.mem.writeInt(u16, udp[0..2], sport, .big);
+    std.mem.writeInt(u16, udp[2..4], dport, .big);
+    std.mem.writeInt(u16, udp[4..6], @intCast(udp.len), .big);
+    std.mem.writeInt(u16, udp[6..8], 0, .big);
+    @memcpy(udp[8..], data);
+    var ck = fold(sum16(udp, pseudoSum(src, dst, proto_udp, udp.len)));
+    if (ck == 0) ck = 0xffff;
+    std.mem.writeInt(u16, udp[6..8], ck, .big);
+    writeIp4Header(buf, src, dst, proto_udp, total);
+    return buf[0..total];
+}
+
+pub const icmp_echo_reply = 0;
+pub const icmp_echo_request = 8;
+
+/// Turns an ICMP echo request into the matching echo reply (into `buf`).
+pub fn buildIcmpEchoReply4(buf: []u8, req: Ip4) ?[]u8 {
+    const icmp_len = req.payload.len;
+    const total = 20 + icmp_len;
+    if (icmp_len < 8 or total > buf.len) return null;
+    const icmp = buf[20..total];
+    @memcpy(icmp, req.payload);
+    icmp[0] = icmp_echo_reply;
+    icmp[1] = 0;
+    std.mem.writeInt(u16, icmp[2..4], 0, .big);
+    std.mem.writeInt(u16, icmp[2..4], fold(sum16(icmp, 0)), .big);
+    writeIp4Header(buf, req.dst, req.src, proto_icmp, total);
+    return buf[0..total];
+}
+
+/// Builds a RST|ACK answering a SYN with sequence number `syn_seq`.
+pub fn buildRst4(buf: *[40]u8, src: [4]u8, sport: u16, dst: [4]u8, dport: u16, syn_seq: u32) []u8 {
+    const tcp = buf[20..40];
+    @memset(tcp, 0);
+    std.mem.writeInt(u16, tcp[0..2], sport, .big);
+    std.mem.writeInt(u16, tcp[2..4], dport, .big);
+    std.mem.writeInt(u32, tcp[4..8], 0, .big);
+    std.mem.writeInt(u32, tcp[8..12], syn_seq +% 1, .big);
+    tcp[12] = 5 << 4;
+    tcp[13] = tcp_rst | tcp_ack;
+    std.mem.writeInt(u16, tcp[16..18], fold(sum16(tcp, pseudoSum(src, dst, proto_tcp, tcp.len))), .big);
+    writeIp4Header(buf, src, dst, proto_tcp, 40);
+    return buf;
+}
+
+test "icmp echo reply" {
+    // Echo request 10.0.0.2 -> 10.0.0.1, id 0x1234 seq 1, payload "abc".
+    var req_buf: [64]u8 = undefined;
+    const icmp_req = [_]u8{ 8, 0, 0, 0, 0x12, 0x34, 0, 1, 'a', 'b', 'c' };
+    @memcpy(req_buf[20..][0..icmp_req.len], &icmp_req);
+    writeIp4Header(&req_buf, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, proto_icmp, 20 + icmp_req.len);
+    const req = parseIp4(req_buf[0 .. 20 + icmp_req.len]).?;
+
+    var out: [64]u8 = undefined;
+    const reply = buildIcmpEchoReply4(&out, req).?;
+    const ip = parseIp4(reply).?;
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, &ip.src);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &ip.dst);
+    try std.testing.expectEqual(@as(u8, icmp_echo_reply), ip.payload[0]);
+    try std.testing.expectEqualSlices(u8, icmp_req[4..], ip.payload[4..]);
+    try std.testing.expectEqual(@as(u16, 0), fold(sum16(ip.payload, 0)));
+    try std.testing.expectEqual(@as(u16, 0), fold(sum16(reply[0..20], 0)));
+}
+
+test "udp round trip and checksums" {
+    var buf: [128]u8 = undefined;
+    const pkt = buildUdp4(&buf, .{ 10, 0, 0, 1 }, 53, .{ 10, 0, 0, 2 }, 40000, "hi").?;
+    // A packet containing a valid checksum sums to zero.
+    try std.testing.expectEqual(@as(u16, 0), fold(sum16(pkt[0..20], 0)));
+    try std.testing.expectEqual(@as(u16, 0), fold(sum16(pkt[20..], pseudoSum(.{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, proto_udp, pkt.len - 20))));
+    const ip = parseIp4(pkt).?;
+    const udp = parseUdp(ip.payload).?;
+    try std.testing.expectEqual(@as(u16, 53), udp.sport);
+    try std.testing.expectEqualStrings("hi", udp.data);
+}

@@ -1,0 +1,13 @@
+.{
+    .name = .zunnel,
+    .version = "0.1.0",
+    .fingerprint = 0xef7734307407f4c5,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .lwip = .{
+            .url = "https://github.com/lwip-tcpip/lwip/archive/refs/tags/STABLE-2_2_1_RELEASE.tar.gz",
+            .hash = "N-V-__8AAGSTdQCcOKeNITCRoYez502saFXZqz4ucBJ4xTa9",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools" },
+}
