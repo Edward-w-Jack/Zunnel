@@ -40,6 +40,14 @@ pub fn runCommand(gpa: std.mem.Allocator, argv: []const []const u8) !void {
     }
 }
 
+/// Runs a helper command whose failure is expected and harmless (e.g. deleting
+/// something that may not exist).
+pub fn runCommandQuiet(gpa: std.mem.Allocator, argv: []const []const u8) void {
+    const res = std.process.Child.run(.{ .allocator = gpa, .argv = argv }) catch return;
+    gpa.free(res.stdout);
+    gpa.free(res.stderr);
+}
+
 /// Validates an IPv4 CIDR such as 10.0.0.0/24.
 pub fn validateCidr(cidr: []const u8) bool {
     _ = Cidr.parse(cidr) catch return false;

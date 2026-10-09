@@ -519,7 +519,14 @@ pub const Flow = struct {
                     }
                     continue;
                 },
-                // ICMP port unreachable etc. surface as errors on connected UDP sockets.
+                // The target answered a datagram with ICMP port unreachable
+                // (ECONNREFUSED / WSAECONNRESET on a connected UDP socket):
+                // tell the peer so the client sees a closed port.
+                error.ConnectionReset => {
+                    log.debug("flow {x}: {f} port unreachable", .{ self.id, self.target });
+                    link.send(.icmp_unreachable, self.id, &.{3}) catch {};
+                    continue;
+                },
                 else => continue,
             };
             self.touch();

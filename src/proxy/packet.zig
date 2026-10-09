@@ -138,6 +138,31 @@ pub fn buildIcmpEchoReply4(buf: []u8, req: Ip4) ?[]u8 {
     return buf[0..total];
 }
 
+pub const icmp_dest_unreachable = 3;
+pub const unreach_net = 0;
+pub const unreach_host = 1;
+pub const unreach_port = 3;
+pub const unreach_admin_prohibited = 13;
+
+/// Builds an ICMP destination-unreachable for `original` (an IPv4 packet we
+/// are refusing), sent back to its source as if from its destination. The
+/// message quotes the original IP header plus 8 bytes, as RFC 792 requires.
+pub fn buildIcmpUnreachable4(buf: []u8, code: u8, original: []const u8) ?[]u8 {
+    const ip = parseIp4(original) orelse return null;
+    const ihl = @as(usize, original[0] & 0x0f) * 4;
+    const quote_len = @min(original.len, ihl + 8);
+    const total = 20 + 8 + quote_len;
+    if (total > buf.len) return null;
+    const icmp = buf[20..total];
+    icmp[0] = icmp_dest_unreachable;
+    icmp[1] = code;
+    @memset(icmp[2..8], 0);
+    @memcpy(icmp[8..], original[0..quote_len]);
+    std.mem.writeInt(u16, icmp[2..4], fold(sum16(icmp, 0)), .big);
+    writeIp4Header(buf, ip.dst, ip.src, proto_icmp, total);
+    return buf[0..total];
+}
+
 /// Builds a RST|ACK answering a SYN with sequence number `syn_seq`.
 pub fn buildRst4(buf: *[40]u8, src: [4]u8, sport: u16, dst: [4]u8, dport: u16, syn_seq: u32) []u8 {
     const tcp = buf[20..40];
@@ -170,6 +195,25 @@ test "icmp echo reply" {
     try std.testing.expectEqualSlices(u8, icmp_req[4..], ip.payload[4..]);
     try std.testing.expectEqual(@as(u16, 0), fold(sum16(ip.payload, 0)));
     try std.testing.expectEqual(@as(u16, 0), fold(sum16(reply[0..20], 0)));
+}
+
+test "icmp unreachable quotes the original header" {
+    var orig_buf: [64]u8 = undefined;
+    const orig = buildUdp4(&orig_buf, .{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 9 }, 161, "probe").?;
+    var out: [128]u8 = undefined;
+    const msg = buildIcmpUnreachable4(&out, unreach_port, orig).?;
+    const ip = parseIp4(msg).?;
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 9 }, &ip.src);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &ip.dst);
+    try std.testing.expectEqual(@as(u8, proto_icmp), ip.proto);
+    try std.testing.expectEqual(@as(u8, icmp_dest_unreachable), ip.payload[0]);
+    try std.testing.expectEqual(@as(u8, unreach_port), ip.payload[1]);
+    try std.testing.expectEqual(@as(u16, 0), fold(sum16(ip.payload, 0)));
+    // Quoted: original 20-byte IP header + the 8-byte UDP header.
+    try std.testing.expectEqual(@as(usize, 8 + 28), ip.payload.len);
+    const quoted = parseUdp(ip.payload[8 + 20 ..]);
+    try std.testing.expect(quoted == null); // only 8 bytes quoted: header but no full datagram
+    try std.testing.expectEqual(@as(u16, 161), std.mem.readInt(u16, ip.payload[8 + 20 + 2 ..][0..2], .big));
 }
 
 test "udp round trip and checksums" {

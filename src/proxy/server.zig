@@ -30,8 +30,6 @@ pub const Session = struct {
     relay: relay.Table,
     /// Next id for TUN flows / pings (guarded by netstack.lock).
     next_flow_id: u32 = 1,
-    /// TCP dials in flight across this agent's tunnels (guarded by netstack.lock).
-    dialing: u32 = 0,
 
     fn parseHello(self: *Session) void {
         var lines = std.mem.tokenizeScalar(u8, self.hello, '\n');
@@ -68,7 +66,7 @@ pub const Server = struct {
     default_localhost_net: tun.Cidr,
     /// Sent with every TCP connect request.
     dial_timeout_ms: u16 = proto.default_dial_timeout_ms,
-    /// Max TCP dials in flight per agent; further SYNs are dropped.
+    /// Max TCP dials in flight per tunnel; further SYNs wait in a queue.
     max_dials: u32 = 256,
 
     /// Guards everything below. Lock order: Server.mutex -> netstack.lock.

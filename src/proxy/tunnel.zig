@@ -84,15 +84,16 @@ const Flow = struct {
     tunnel: *Tunnel,
     id: u32,
     tuple: Tuple,
-    state: enum { dialing, open } = .dialing,
+    /// queued: waiting for a free dial slot; dialing: agent is connecting.
+    state: enum { queued, dialing, open } = .dialing,
     created: i64,
 
     // --- TCP
     /// The client's SYN, replayed into lwIP once the agent connected.
     syn: ?[]u8 = null,
     syn_seq: u32 = 0,
-    /// Set while this flow counts against `Session.dialing`.
-    dial_session: ?*Session = null,
+    /// Set while this flow occupies one of the tunnel's dial slots.
+    holds_dial_slot: bool = false,
     pcb: ?*c.struct_tcp_pcb = null,
     /// client -> agent bytes waiting for agent credit (lwIP window stays closed meanwhile).
     from_client: ByteQueue = .{},
@@ -108,6 +109,35 @@ const Flow = struct {
     // --- UDP
     last_active: i64 = 0,
 };
+
+/// What recently happened to a TCP 4-tuple that has no flow anymore.
+const Verdict = enum {
+    /// Closed normally: late FIN/ACKs still go to lwIP's lingering pcb.
+    closing,
+    // Dial failures, replayed to retransmitted SYNs without dialing again.
+    refused,
+    timeout,
+    unreachable_net,
+    unreachable_host,
+    prohibited,
+
+    fn fromReason(r: proto.FailReason) Verdict {
+        return switch (r) {
+            .timeout => .timeout,
+            .unreachable_net => .unreachable_net,
+            .unreachable_host => .unreachable_host,
+            .prohibited => .prohibited,
+            else => .refused,
+        };
+    }
+};
+
+const Recent = struct { verdict: Verdict, expires: i64 };
+const closing_ttl_ms = 60 * std.time.ms_per_s;
+const verdict_ttl_ms = 10 * std.time.ms_per_s;
+const max_recent = 65536;
+/// SYNs waiting for a dial slot (per tunnel) before further ones are dropped.
+const max_dial_queue = 8192;
 
 /// An echo request waiting for the agent's verdict.
 const PendingIcmp = struct {
@@ -143,6 +173,12 @@ pub const Tunnel = struct {
     flows: std.AutoHashMapUnmanaged(u32, *Flow) = .empty,
     by_tuple: std.AutoHashMapUnmanaged(Tuple, *Flow) = .empty,
     icmp: std.AutoHashMapUnmanaged(u32, PendingIcmp) = .empty,
+    recent: std.AutoHashMapUnmanaged(Tuple, Recent) = .empty,
+    /// TCP dials in flight; SYNs beyond `max_dials` wait in `dial_queue`.
+    dialing: u32 = 0,
+    dial_queue: std.ArrayList(u32) = .empty,
+    dial_queue_head: usize = 0,
+    tearing_down: bool = false,
 
     pub fn create(gpa: Allocator, if_name: []const u8, index: u8, localhost_net: tun.Cidr) !*Tunnel {
         try netstack.start(gpa);
@@ -221,6 +257,8 @@ pub const Tunnel = struct {
             var it = self.icmp.valueIterator();
             while (it.next()) |p| self.gpa.free(p.request);
             self.icmp.deinit(self.gpa);
+            self.recent.deinit(self.gpa);
+            self.dial_queue.deinit(self.gpa);
             self.flows.deinit(self.gpa);
             self.by_tuple.deinit(self.gpa);
         }
@@ -279,14 +317,20 @@ pub const Tunnel = struct {
     }
 
     fn abortAll(self: *Tunnel) void {
+        self.tearing_down = true;
+        defer self.tearing_down = false;
         while (true) {
             var it = self.flows.valueIterator();
             const flow = (it.next() orelse break).*;
             self.abortFlow(flow, true);
         }
+        self.dial_queue.clearRetainingCapacity();
+        self.dial_queue_head = 0;
         var it = self.icmp.valueIterator();
         while (it.next()) |p| self.gpa.free(p.request);
         self.icmp.clearRetainingCapacity();
+        // Verdicts came from the previous agent's vantage point.
+        self.recent.clearRetainingCapacity();
     }
 
     // ------------------------------------------------------------ threads
@@ -326,6 +370,18 @@ pub const Tunnel = struct {
         var pit = self.icmp.iterator();
         while (pit.next()) |e| if (now > e.value_ptr.deadline) expired_icmp.append(self.gpa, e.key_ptr.*) catch break;
         for (expired_icmp.items) |id| if (self.icmp.fetchRemove(id)) |kv| self.gpa.free(kv.value.request);
+
+        var expired_recent: std.ArrayList(Tuple) = .empty;
+        defer expired_recent.deinit(self.gpa);
+        var rit = self.recent.iterator();
+        while (rit.next()) |e| if (now > e.value_ptr.expires) expired_recent.append(self.gpa, e.key_ptr.*) catch break;
+        for (expired_recent.items) |t| _ = self.recent.remove(t);
+    }
+
+    fn remember(self: *Tunnel, t: Tuple, verdict: Verdict) void {
+        if (self.recent.count() >= max_recent) return;
+        const ttl: i64 = if (verdict == .closing) closing_ttl_ms else verdict_ttl_ms;
+        self.recent.put(self.gpa, t, .{ .verdict = verdict, .expires = std.time.milliTimestamp() + ttl }) catch {};
     }
 
     // ------------------------------------------------------- packet input
@@ -335,16 +391,25 @@ pub const Tunnel = struct {
         switch (ip.proto) {
             packet.proto_tcp => {
                 const seg = packet.parseTcp(ip.payload) orelse return;
-                if (seg.flags & (packet.tcp_syn | packet.tcp_ack | packet.tcp_rst) == packet.tcp_syn) {
-                    const t: Tuple = .{ .proto = packet.proto_tcp, .src = ip.src, .sport = seg.sport, .dst = ip.dst, .dport = seg.dport };
-                    if (self.by_tuple.get(t)) |flow| {
-                        if (flow.state == .dialing) return; // SYN retransmit while the agent dials
-                    } else {
-                        self.newTcpFlow(t, seg.seq, pkt);
-                        return;
+                const is_syn = seg.flags & (packet.tcp_syn | packet.tcp_ack | packet.tcp_rst) == packet.tcp_syn;
+                const t: Tuple = .{ .proto = packet.proto_tcp, .src = ip.src, .sport = seg.sport, .dst = ip.dst, .dport = seg.dport };
+                if (self.by_tuple.get(t)) |flow| {
+                    if (is_syn and flow.state != .open) return; // SYN retransmit while queued/dialing
+                    return self.feed(pkt);
+                }
+                if (self.recent.get(t)) |r| {
+                    if (r.verdict == .closing) {
+                        if (!is_syn) return self.feed(pkt); // late FIN/ACK for lwIP's lingering pcb
+                        _ = self.recent.remove(t); // port reused: a new connection
+                    } else if (is_syn) {
+                        // Retransmitted SYN after a failed dial: same answer, no new dial.
+                        return self.answerFailure(t, seg.seq, r.verdict, pkt);
                     }
                 }
-                self.feed(pkt);
+                if (is_syn) return self.newTcpFlow(t, seg.seq, pkt);
+                // Stray segment for a connection that never existed: a VPN would
+                // deliver it to a host that may not exist, so stay silent rather
+                // than letting lwIP answer with a RST (which makes every IP look up).
             },
             packet.proto_udp => self.onUdp(ip),
             packet.proto_icmp => self.onIcmp(ip, pkt),
@@ -399,20 +464,67 @@ pub const Tunnel = struct {
 
     fn newTcpFlow(self: *Tunnel, t: Tuple, seq: u32, syn: []const u8) void {
         const session = self.session orelse return self.sendRst(t, seq);
-        // Too many dials in flight for this agent: drop the SYN. The client
-        // retransmits, which looks like congestion and slows scanners down.
-        if (session.dialing >= session.server.max_dials) return;
+        const full = self.dialing >= session.server.max_dials;
+        // Beyond the queue limit, drop the SYN: the client retransmits later.
+        if (full and self.dial_queue.items.len - self.dial_queue_head >= max_dial_queue) return;
         const flow = self.newFlow(t) catch return;
-        flow.dial_session = session;
-        session.dialing += 1;
         flow.syn_seq = seq;
         flow.syn = self.gpa.dupe(u8, syn) catch return self.abortFlow(flow, false);
-        self.sendConnect(flow, .tcp) catch return self.abortFlow(flow, false);
+        if (full) {
+            flow.state = .queued;
+            self.dial_queue.append(self.gpa, flow.id) catch return self.abortFlow(flow, false);
+            return;
+        }
+        self.startDial(flow);
+    }
+
+    /// Takes a dial slot and asks the agent to connect.
+    fn startDial(self: *Tunnel, flow: *Flow) void {
+        flow.state = .dialing;
+        flow.holds_dial_slot = true;
+        self.dialing += 1;
+        self.sendConnect(flow, .tcp) catch self.abortFlow(flow, false);
+    }
+
+    /// Releases the flow's dial slot (idempotent) and starts queued dials.
+    fn endDial(self: *Tunnel, flow: *Flow) void {
+        if (!flow.holds_dial_slot) return;
+        flow.holds_dial_slot = false;
+        self.dialing -= 1;
+        if (self.tearing_down) return;
+        const session = self.session orelse return;
+        while (self.dialing < session.server.max_dials and self.dial_queue_head < self.dial_queue.items.len) {
+            const id = self.dial_queue.items[self.dial_queue_head];
+            self.dial_queue_head += 1;
+            const next = self.flows.get(id) orelse continue;
+            if (next.state == .queued) self.startDial(next);
+        }
+        if (self.dial_queue_head == self.dial_queue.items.len) {
+            self.dial_queue.clearRetainingCapacity();
+            self.dial_queue_head = 0;
+        }
     }
 
     fn sendRst(self: *Tunnel, t: Tuple, syn_seq: u32) void {
         var buf: [40]u8 = undefined;
         self.dev.write(packet.buildRst4(&buf, t.dst, t.dport, t.src, t.sport, syn_seq));
+    }
+
+    fn sendUnreachable(self: *Tunnel, original: []const u8, code: u8) void {
+        var buf: [128]u8 = undefined;
+        if (packet.buildIcmpUnreachable4(&buf, code, original)) |msg| self.dev.write(msg);
+    }
+
+    /// Answers a SYN whose dial failed the way the real network would have.
+    fn answerFailure(self: *Tunnel, t: Tuple, syn_seq: u32, verdict: Verdict, syn: []const u8) void {
+        switch (verdict) {
+            .refused => self.sendRst(t, syn_seq),
+            // Filtered: the real network would have dropped the SYN.
+            .timeout, .closing => {},
+            .unreachable_net => self.sendUnreachable(syn, packet.unreach_net),
+            .unreachable_host => self.sendUnreachable(syn, packet.unreach_host),
+            .prohibited => self.sendUnreachable(syn, packet.unreach_admin_prohibited),
+        }
     }
 
     fn onUdp(self: *Tunnel, ip: packet.Ip4) void {
@@ -472,7 +584,7 @@ pub const Tunnel = struct {
         switch (frame.type) {
             .connect_ok => if (flow.state == .dialing) {
                 flow.state = .open;
-                endDial(flow);
+                self.endDial(flow);
                 if (flow.syn) |syn| {
                     flow.syn = null;
                     self.feed(syn);
@@ -482,7 +594,14 @@ pub const Tunnel = struct {
             .connect_fail => {
                 const reason: proto.FailReason = if (frame.payload.len > 0) @enumFromInt(frame.payload[0]) else .other;
                 log.debug("dial {any}:{d} failed: {s}", .{ flow.tuple.dst, flow.tuple.dport, @tagName(reason) });
-                self.abortFlow(flow, false);
+                if (flow.state != .dialing) {
+                    self.abortFlow(flow, false);
+                    return true;
+                }
+                const verdict = Verdict.fromReason(reason);
+                self.answerFailure(flow.tuple, flow.syn_seq, verdict, flow.syn orelse &.{});
+                self.remember(flow.tuple, verdict);
+                self.destroyFlow(flow);
             },
             .data => {
                 if (flow.to_client.len() + frame.payload.len > 2 * proto.initial_window) {
@@ -523,6 +642,15 @@ pub const Tunnel = struct {
                 const t = flow.tuple;
                 const pkt = packet.buildUdp4(&buf, t.dst, t.dport, t.src, t.sport, frame.payload) orelse return;
                 self.dev.write(pkt);
+            },
+            .icmp_unreachable => {
+                // The target answered with ICMP unreachable (closed UDP port):
+                // relay it, quoting a datagram header rebuilt from the flow.
+                const code = if (frame.payload.len > 0) frame.payload[0] else packet.unreach_port;
+                var orig: [28]u8 = undefined;
+                const t = flow.tuple;
+                const quoted = packet.buildUdp4(&orig, t.src, t.sport, t.dst, t.dport, &.{}) orelse return;
+                self.sendUnreachable(quoted, code);
             },
             else => {},
         }
@@ -598,7 +726,7 @@ pub const Tunnel = struct {
             detachPcb(pcb);
             c.tcp_abort(pcb);
             flow.pcb = null;
-        } else if (flow.tuple.proto == packet.proto_tcp and flow.state == .dialing) {
+        } else if (flow.tuple.proto == packet.proto_tcp and flow.state != .open) {
             self.sendRst(flow.tuple, flow.syn_seq);
         }
         if (notify_agent) {
@@ -608,7 +736,10 @@ pub const Tunnel = struct {
     }
 
     fn destroyFlow(self: *Tunnel, flow: *Flow) void {
-        endDial(flow);
+        self.endDial(flow);
+        // lwIP may still hold the pcb (LAST_ACK/TIME_WAIT): keep routing the
+        // connection's late segments to it instead of dropping them as strays.
+        if (flow.tuple.proto == packet.proto_tcp and flow.state == .open) self.remember(flow.tuple, .closing);
         _ = self.flows.remove(flow.id);
         _ = self.by_tuple.remove(flow.tuple);
         if (flow.syn) |s| self.gpa.free(s);
@@ -617,13 +748,6 @@ pub const Tunnel = struct {
         self.gpa.destroy(flow);
     }
 };
-
-/// Releases the flow's slot in its session's dial budget (idempotent).
-fn endDial(flow: *Flow) void {
-    const s = flow.dial_session orelse return;
-    s.dialing -= 1;
-    flow.dial_session = null;
-}
 
 fn detachPcb(pcb: *c.struct_tcp_pcb) void {
     c.tcp_arg(pcb, null);

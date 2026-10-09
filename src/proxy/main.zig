@@ -25,7 +25,7 @@ const usage =
     \\  -localhost-net <cidr> destinations in this network reach the agent's 127.0.0.1
     \\                       (default 240.0.0.0/4; Windows cannot route 240/4, use e.g. 198.18.255.0/24)
     \\  -dial-timeout <ms>   how long agents try to connect before giving up (default 3000)
-    \\  -max-dials <n>       max connects in flight per agent; extra SYNs are dropped (default 256)
+    \\  -max-dials <n>       max connects in flight per interface; extra SYNs queue (default 256)
     \\
 ;
 

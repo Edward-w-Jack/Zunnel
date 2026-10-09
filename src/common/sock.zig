@@ -151,6 +151,15 @@ fn tcpConnectWindows(addr: std.net.Address, timeout_ms: u32) ConnectError!Handle
     errdefer close(h);
     var nonblocking: u32 = 1;
     if (ws2.ioctlsocket(h, ws2.FIONBIO, &nonblocking) == ws2.SOCKET_ERROR) return error.ConnectFailed;
+    // Windows answers a RST to its SYN by retrying the SYN twice, so a closed
+    // port takes ~2 s to report "refused". Allowing one retransmission cuts that
+    // to ~0.5 s and still tolerates a single lost SYN. Best effort: older
+    // Windows versions lack SIO_TCP_INITIAL_RTO.
+    const SIO_TCP_INITIAL_RTO: u32 = 0x98000011;
+    const InitialRto = extern struct { rtt: u16, max_syn_retransmissions: u8 };
+    var rto: InitialRto = .{ .rtt = 0xffff, .max_syn_retransmissions = 1 };
+    var returned: u32 = 0;
+    _ = ws2.WSAIoctl(h, SIO_TCP_INITIAL_RTO, &rto, @sizeOf(InitialRto), null, 0, &returned, null, null);
 
     if (ws2.connect(h, &addr.any, @intCast(addr.getOsSockLen())) == ws2.SOCKET_ERROR) {
         switch (ws2.WSAGetLastError()) {

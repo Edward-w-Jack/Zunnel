@@ -91,7 +91,23 @@ pub const Tun = struct {
         defer gpa.free(addr_arg);
         tun.runCommand(gpa, &.{ "netsh", "interface", "ipv4", "set", "address", name_arg, "source=static", addr_arg, "mask=255.255.255.255", "gateway=none", "store=active" }) catch
             std.log.warn("could not assign {s} to {s}", .{ addr_arg, name });
+
+        // New adapters land in the Public firewall profile, which drops inbound
+        // ICMP destination-unreachable. Allow it to this adapter's address only,
+        // so closed UDP ports and unreachable hosts reach the operator's tools.
+        self.firewallRule(.add, a) catch std.log.warn("could not add firewall rule for ICMP unreachable on {s}", .{name});
         return self;
+    }
+
+    fn firewallRule(self: *const Tun, op: enum { add, delete }, a: [4]u8) !void {
+        const rule = try std.fmt.allocPrint(self.gpa, "name=zunnel-{s}-icmp-unreachable", .{self.name});
+        defer self.gpa.free(rule);
+        // Delete first so a leftover rule from a crashed run is replaced, not duplicated.
+        tun.runCommandQuiet(self.gpa, &.{ "netsh", "advfirewall", "firewall", "delete", "rule", rule });
+        if (op == .delete) return;
+        const localip = try std.fmt.allocPrint(self.gpa, "localip={d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] });
+        defer self.gpa.free(localip);
+        try tun.runCommand(self.gpa, &.{ "netsh", "advfirewall", "firewall", "add", "rule", rule, "dir=in", "action=allow", "protocol=icmpv4:3,any", localip });
     }
 
     pub fn read(self: *Tun, buf: []u8) !usize {
@@ -135,6 +151,7 @@ pub const Tun = struct {
     }
 
     pub fn close(self: *Tun) void {
+        self.firewallRule(.delete, undefined) catch {};
         self.api.WintunEndSession(self.session);
         self.api.WintunCloseAdapter(self.adapter);
         self.gpa.free(self.name);
