@@ -42,16 +42,18 @@ with no SOCKS and no proxychains.
 Requires Zig 0.15.2.
 
 ```sh
-zig build -Doptimize=ReleaseSafe                                   # host
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl        # static Linux binaries
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows           # Windows binaries
-zig build test                                                     # unit tests
+zig build -Drelease                                                      # host (ReleaseSafe)
+zig build -Drelease -Dtarget=x86_64-linux-musl --prefix zig-out/linux    # static Linux binaries
+zig build -Drelease -Dtarget=x86_64-windows --prefix zig-out/windows     # Windows binaries
+zig build test                                                           # unit + fuzz-corpus tests
+zig build test --fuzz                                                    # coverage-guided fuzzing (Linux only)
 ```
 
 Binaries go to `zig-out/bin/` (use `--prefix zig-out/<name>` to keep per-target builds apart).
-Use `ReleaseSafe` for real use. Both binaries parse untrusted network input, and `ReleaseSmall`
+`-Drelease` builds `ReleaseSafe`. Both binaries parse untrusted network input, and `ReleaseSmall`
 / `ReleaseFast` remove the bounds and overflow checks that turn parser bugs into clean crashes
-instead of memory corruption.
+instead of memory corruption. The frame parser, message decoders, packet parsers and handshake
+reader all have fuzz tests.
 
 ## Privileges
 
@@ -61,7 +63,9 @@ instead of memory corruption.
 | Needs `wintun.dll` | Yes, on Windows | **No** |
 | Files to deploy | `zunnel-proxy` (+ `wintun.dll` on Windows) | the single `zunnel-agent` binary |
 
-The proxy always runs elevated with a TUN. The agent is a multiplexer that turns proxy requests
+The proxy always runs elevated with a TUN, and refuses to start otherwise (on Windows it also
+checks for `wintun.dll`). On Linux, a TUN pre-created for your user (`sudo ip tuntap add user
+$USER mode tun <name>`) also works. The agent is a multiplexer that turns proxy requests
 into ordinary socket calls (`connect`, `send`, `recv`), so it works as any normal user. Without
 privileges, the agent has these limits:
 
@@ -120,26 +124,72 @@ zunnel> route add 10.20.0.0/16 deep
 Traffic to agent #2 is encrypted twice while it crosses agent #1: once for agent #1's link,
 once for agent #2's own end-to-end session.
 
-On Windows the proxy needs Administrator rights and `wintun.dll` (from https://www.wintun.net)
-next to `zunnel-proxy.exe`. Interfaces get addresses `198.18.0.1/32`, `198.18.0.2/32`, and so on. Windows refuses to
-send to `240.0.0.0/4`, so on Windows pick another network to reach the agent's localhost:
+`route add` refuses a network that contains an agent's own link address, because routing it into
+the tunnel would cut that agent off. Append `force` to override.
+
+`exit`, Ctrl-C and SIGTERM shut down cleanly: routes, interfaces and firewall rules are removed and
+agents are disconnected (`-retry` agents reconnect when the proxy comes back).
+
+### Proxy options
+
+| Option | Default | |
+|---|---|---|
+| `-listen <addr:port>` | `0.0.0.0:11601` | where agents connect |
+| `-key <file>` | `zunnel.key` | proxy private key, created if missing |
+| `-secret <s>` | none | shared secret agents must present (recommended) |
+| `-tun <name>` | `zunnel` | default interface name |
+| `-route <cidr>` | | route a network through the default interface (repeatable) |
+| `-autostart` | off | create the default interface at startup and attach the first agent |
+| `-localhost-net <cidr>` | `240.0.0.0/4` | destinations here reach the agent's `127.0.0.1` |
+| `-dial-timeout <ms>` | `3000` | how long the agent tries to connect before reporting *filtered* |
+| `-max-dials <n>` | `256` | connects in flight per interface; extra SYNs queue (up to 8192) |
+
+### Windows notes
+
+The proxy needs Administrator rights and `wintun.dll` (from https://www.wintun.net) next to
+`zunnel-proxy.exe`. Interfaces get addresses `198.18.0.1/32`, `198.18.0.2/32`, and so on, skipping
+any already in use, so several proxies can run on one machine. Each interface gets a firewall rule
+allowing inbound ICMP destination-unreachable to its own address only (new adapters are on the
+Public profile, which drops it), and the rule is removed with the interface. The proxy's listening
+port is opened with `SO_EXCLUSIVEADDRUSE`, so no other local program can take it over.
+
+Windows refuses to send to `240.0.0.0/4`, so on Windows pick another network to reach the agent's
+localhost:
 
 ```
 zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -route 10.10.0.0/16
 ```
 
+## Reliability
+
+- **Heartbeat:** both ends ping every 10 s and drop the link after 30 s of silence, so dead links
+  (NAT timeouts, a frozen or killed peer) are noticed quickly and `-retry` agents reconnect.
+- **Bounded dials:** the agent connects with a timeout (`-dial-timeout`), at most `-max-dials`
+  connects run per interface, and further SYNs queue instead of spawning more work. A 2,000-port
+  burst finishes in about 16 s with one agent connect per port.
+- **Bounded handshakes:** at most 64 handshakes are in progress (8 per source address), each with a
+  10 s timeout.
+
 ## Scanning through the tunnel
 
-The agent has no privileges, so it can't send raw packets. Every probe becomes a real `connect()`
-from the agent host:
+Tools should see what they would see on a VPN inside the target network. The agent has no
+privileges, so every TCP probe becomes a real `connect()` from the agent host, and the proxy
+translates the result back into packets:
 
-- `-sT`, `-sS`, `-sV` and NSE work. `-sS` behaves like `-sT`: open ports report correctly, and
-  the target sees a full TCP connection from the agent for each one.
-- Host discovery: use `-PE` (ICMP echo is supported) or `-Pn`. Until the stray-ACK fix below
-  lands, nmap's default discovery reports every address as up.
+| What happened on the agent | What your tool sees | nmap reports |
+|---|---|---|
+| Connection accepted | SYN-ACK | open |
+| Connection refused | RST | closed |
+| Timed out (`-dial-timeout`) | nothing | filtered |
+| Host / network unreachable | ICMP destination unreachable | filtered / host down |
+| Blocked locally on the agent | ICMP admin-prohibited | filtered |
+| UDP port closed | ICMP port unreachable | closed (`-sU`) |
+| Stray ACK for no connection | nothing | (no false "host up") |
+
+- `-sT`, `-sS`, `-sU`, `-sV`, NSE and default host discovery work. `-sS` behaves like `-sT`: the
+  target sees a full TCP connection from the agent for each open port.
+- Failed dials are cached for 10 s, so retransmitted SYNs get the same answer without another dial.
 - Not possible through any unprivileged pivot: `-sA/-sF/-sN/-sX/-sW`, `-O`, `--traceroute`.
-
-Recommended for now: `nmap -sT -PE -T4 --max-retries 1 <targets>`.
 
 ## Done
 
@@ -148,38 +198,12 @@ Recommended for now: `nmap -sT -PE -T4 --max-retries 1 <targets>`.
 - [x] Listeners (TCP + UDP)
 - [x] Multiple simultaneous tunnels
 - [x] Multi-hop relays
+- [x] P0 reliability and safety: heartbeat, dial timeouts and caps, bounded handshakes, route
+  guard, fuzz tests, graceful shutdown, startup checks
+- [x] P0 VPN-accurate scanning: stray packets dropped, failure-specific answers (RST / silence /
+  ICMP unreachable), UDP closed ports, SYN queueing
 
 ## Roadmap
-
-### P0: reliability and safety (before real engagements)
-- [ ] **Link heartbeat.** Ping every 10 s and drop the session after 3 misses, on both sides.
-  Today only OS TCP keepalive (~2 h) notices a dead link, so NAT timeouts leave zombie sessions
-  and `-retry` agents never reconnect.
-- [ ] **Agent dial timeout and concurrency cap.** Non-blocking connect with a 5 s default, a
-  limit on dials in flight, and a cap on dialing flows per tunnel on the proxy. Today a dial
-  blocks ~21 s (Windows) or ~2 min (Linux) on its own thread, so scanning firewalled hosts can
-  spawn thousands of threads.
-- [ ] **Bounded handshakes.** Limit concurrent handshakes, shorten the 15 s timeout, and rate-limit
-  accepts per source IP. Every inbound connection currently gets its own thread.
-- [ ] **Route self-capture guard.** Refuse (or require `force`) a `route add` that covers an
-  agent's own link address, which would silently kill the session.
-- [ ] **Fuzzing.** Fuzz `Link.recvFrame`, the `proto.*.decode` functions and `packet.parse*` with
-  `std.testing.fuzz`.
-- [ ] **Graceful shutdown.** On Ctrl-C/SIGTERM, remove routes, close adapters and tell agents.
-- [ ] **Startup checks.** Fail fast if the proxy is not root/Administrator, or `wintun.dll` is
-  missing on Windows, instead of failing at the first `start`.
-
-### P0: behave like a normal VPN (scan accuracy)
-Tools should behave as if the operator were on a VPN inside the target network.
-- [ ] **Drop stray TCP packets** that match no flow (non-SYN, unknown tuple) instead of passing
-  them to lwIP. lwIP answers them with a RST, which makes nmap's default ACK probe report every
-  IP as up.
-- [ ] **Accurate failure signals.** When the agent's dial is refused, reply with RST (as now).
-  When it times out or has no route, reply with ICMP destination-unreachable (or silence), so
-  nmap reports *filtered* or *down* instead of *closed*.
-- [ ] **UDP closed ports.** The agent reports `ECONNREFUSED`/`WSAECONNRESET` on UDP flows, and the
-  proxy synthesises ICMP port-unreachable so `-sU` and other UDP tools see closed ports.
-- [ ] The dial timeout and concurrency cap above, so large scans stay fast and bounded.
 
 ### P1: operations
 - [ ] **Stable agent identity.** A reconnecting agent automatically gets back its interfaces, routes and listeners.
@@ -193,6 +217,7 @@ Tools should behave as if the operator were on a VPN inside the target network.
 - [ ] Proxy config file: interfaces, routes and listeners restored on startup.
 - [ ] `kill <agent>`, and an optional agent `-expire <time>` for engagement windows.
 - [ ] Console line editing, history and tab completion.
+- [ ] Console output that doesn't interleave with the prompt.
 
 ### P2: transports and evasion
 - [ ] Alternate transports: TLS (looks like HTTPS) and WebSocket. Agent support for HTTP CONNECT
