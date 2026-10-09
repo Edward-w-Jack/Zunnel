@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const common = @import("common");
 const privileges = @import("privileges.zig");
 const ui = @import("ui.zig");
+const lineedit = @import("lineedit.zig");
 const tun = @import("tun.zig");
 const server_mod = @import("server.zig");
 const tunnel_mod = @import("tunnel.zig");
@@ -196,7 +197,13 @@ fn installShutdownHandlers(server: *Server) void {
 }
 
 fn onConsoleCtrl(_: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
-    std.debug.print("\nshutting down...\n", .{});
+    quit();
+}
+
+/// Restores the terminal, removes interfaces and routes, and exits.
+fn quit() noreturn {
+    ui.restoreTerminal();
+    std.debug.print("shutting down...\n", .{});
     if (shutdown_server) |s| s.shutdown();
     std.process.exit(0);
 }
@@ -207,9 +214,7 @@ fn onSignal(_: c_int) callconv(.c) void {
 
 fn shutdownWatcher() void {
     while (!stop_requested.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
-    std.debug.print("\nshutting down...\n", .{});
-    if (shutdown_server) |s| s.shutdown();
-    std.process.exit(0);
+    quit();
 }
 
 const help_text =
@@ -257,16 +262,179 @@ const Console = struct {
     /// -config file; the default target of `save`.
     config_path: ?[]const u8 = null,
 
+    const prompt = "zunnel> ";
+
     fn run(self: *Console) void {
+        if (lineedit.Terminal.interactive() and ui.terminal.enterRaw()) return self.runInteractive();
+        // Not a terminal (piped/redirected stdin, services): plain line reading.
         var buf: [1024]u8 = undefined;
         var reader = std.fs.File.stdin().reader(&buf);
         while (true) {
-            std.debug.print("zunnel> ", .{});
+            std.debug.print(prompt, .{});
             const line = reader.interface.takeDelimiter('\n') catch break orelse break;
             self.exec(std.mem.trim(u8, line, " \t\r"));
         }
         // stdin closed (e.g. running as a service): keep serving.
         while (true) std.Thread.sleep(std.time.ns_per_hour);
+    }
+
+    /// Terminal console: line editing, history (~/.zunnel_history) and tab
+    /// completion; output from other threads redraws around the input line.
+    fn runInteractive(self: *Console) void {
+        var ed: lineedit.Editor = .{ .gpa = self.gpa };
+        const history_path = historyPath(self.gpa);
+        if (history_path) |p| loadHistory(&ed, p);
+        ui.showLine(prompt, "", 0);
+        while (lineedit.Terminal.readByte()) |b| {
+            switch (ed.feed(b)) {
+                .none => {},
+                .redraw => ui.showLine(prompt, ed.line(), ed.cursor),
+                .submit => {
+                    var copy: [lineedit.max_line]u8 = undefined;
+                    const line = copy[0..ed.len];
+                    @memcpy(line, ed.line());
+                    ui.endLine();
+                    ed.remember(line);
+                    if (history_path) |p| appendHistory(p, line);
+                    ed.reset();
+                    self.exec(std.mem.trim(u8, line, " \t"));
+                    ui.showLine(prompt, "", 0);
+                },
+                .eof => {
+                    ui.endLine();
+                    quit();
+                },
+                .complete => {
+                    var store: Completions = .{};
+                    self.complete(ed.beforeCursor(), &store);
+                    if (ed.applyCompletion(store.items[0..store.n])) {
+                        var list: [2048]u8 = undefined;
+                        var w = std.Io.Writer.fixed(&list);
+                        for (store.items[0..store.n]) |c| w.print("{s}  ", .{c}) catch break;
+                        w.writeAll("\n") catch {};
+                        ui.out(w.buffered());
+                    }
+                    ui.showLine(prompt, ed.line(), ed.cursor);
+                },
+                .clear_screen => {
+                    std.fs.File.stderr().writeAll("\x1b[2J\x1b[H") catch {};
+                    ui.showLine(prompt, ed.line(), ed.cursor);
+                },
+            }
+        }
+        // Input closed: keep serving without a console.
+        ui.restoreTerminal();
+        while (true) std.Thread.sleep(std.time.ns_per_hour);
+    }
+
+    fn historyPath(gpa: Allocator) ?[]const u8 {
+        const home = std.process.getEnvVarOwned(gpa, if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") catch return null;
+        return std.fs.path.join(gpa, &.{ home, ".zunnel_history" }) catch null;
+    }
+
+    fn loadHistory(ed: *lineedit.Editor, path: []const u8) void {
+        const data = std.fs.cwd().readFileAlloc(ed.gpa, path, 1024 * 1024) catch return;
+        defer ed.gpa.free(data);
+        var lines = std.mem.tokenizeAny(u8, data, "\r\n");
+        while (lines.next()) |l| ed.remember(l);
+    }
+
+    fn appendHistory(path: []const u8, line: []const u8) void {
+        const t = std.mem.trim(u8, line, " \t");
+        if (t.len == 0) return;
+        const f = std.fs.cwd().createFile(path, .{ .truncate = false }) catch return;
+        defer f.close();
+        f.seekFromEnd(0) catch return;
+        f.writeAll(t) catch return;
+        f.writeAll("\n") catch {};
+    }
+
+    // ---------------------------------------------------------- completion
+
+    const Completions = struct {
+        items: [64][]const u8 = undefined,
+        n: usize = 0,
+        text: [2048]u8 = undefined,
+        used: usize = 0,
+
+        fn add(self: *Completions, prefix: []const u8, candidate: []const u8) void {
+            if (!std.mem.startsWith(u8, candidate, prefix)) return;
+            if (self.n == self.items.len or self.used + candidate.len > self.text.len) return;
+            for (self.items[0..self.n]) |c| if (eql(c, candidate)) return;
+            const dst = self.text[self.used..][0..candidate.len];
+            @memcpy(dst, candidate);
+            self.used += candidate.len;
+            self.items[self.n] = dst;
+            self.n += 1;
+        }
+    };
+
+    const commands = [_][]const u8{
+        "sessions", "start",     "stop",     "bind",  "unbind",   "bindings", "ifaces",
+        "iface",    "route",     "listener", "listeners", "relay", "flows", "ifconfig",
+        "session",  "kill",      "save",     "help",  "exit",
+    };
+
+    /// Fills `out` with candidates for the word being typed at the end of `before`.
+    fn complete(self: *Console, before: []const u8, out: *Completions) void {
+        var words: [8][]const u8 = undefined;
+        var n: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, before, ' ');
+        while (it.next()) |w| : (n += 1) if (n < words.len) {
+            words[n] = w;
+        };
+        n = @min(n, words.len);
+        const new_word = before.len == 0 or before[before.len - 1] == ' ';
+        const idx = if (new_word) n else n - 1;
+        const prefix = if (new_word) "" else words[n - 1];
+        if (idx == 0) {
+            for (commands) |c| out.add(prefix, c);
+            return;
+        }
+        const cmd = words[0];
+        const sub = if (idx >= 2) words[1] else "";
+        const Kind = enum { none, agents, ifaces, listeners };
+        var kind: Kind = .none;
+        if (eql(cmd, "start")) {
+            kind = if (idx == 1) .agents else if (idx == 2) .ifaces else .none;
+        } else if (eql(cmd, "stop") or eql(cmd, "flows") or eql(cmd, "unbind")) {
+            kind = if (idx == 1) .ifaces else .none;
+        } else if (eql(cmd, "kill") or eql(cmd, "ifconfig") or eql(cmd, "relay")) {
+            kind = if (idx == 1) .agents else .none;
+        } else if (eql(cmd, "bind")) {
+            kind = if (idx == 1) .ifaces else if (idx == 2) .agents else .none;
+        } else if (eql(cmd, "session")) {
+            if (idx == 1) out.add(prefix, "info");
+            if (idx == 2) kind = .agents;
+        } else if (eql(cmd, "iface")) {
+            if (idx == 1) for ([_][]const u8{ "add", "del" }) |c| out.add(prefix, c);
+            if (idx == 2 and eql(sub, "del")) kind = .ifaces;
+        } else if (eql(cmd, "route")) {
+            if (idx == 1) for ([_][]const u8{ "add", "del", "list" }) |c| out.add(prefix, c);
+            if (idx == 3) kind = .ifaces;
+            if (idx >= 3 and eql(sub, "add")) out.add(prefix, "force");
+        } else if (eql(cmd, "listener")) {
+            if (idx == 1) for ([_][]const u8{ "add", "del", "list" }) |c| out.add(prefix, c);
+            if (idx == 2) kind = if (eql(sub, "add")) .agents else if (eql(sub, "del")) .listeners else .none;
+            if (idx == 3 and eql(sub, "add")) for ([_][]const u8{ "tcp", "udp" }) |c| out.add(prefix, c);
+        }
+        if (kind == .none) return;
+
+        self.server.mutex.lock();
+        defer self.server.mutex.unlock();
+        switch (kind) {
+            .agents => for (self.server.sessions.items) |s| {
+                var num: [12]u8 = undefined;
+                out.add(prefix, std.fmt.bufPrint(&num, "{d}", .{s.id}) catch continue);
+                out.add(prefix, s.ident);
+            },
+            .ifaces => for (self.server.tunnels.items) |t| out.add(prefix, t.name),
+            .listeners => for (self.server.listeners.items) |l| {
+                var num: [12]u8 = undefined;
+                out.add(prefix, std.fmt.bufPrint(&num, "{d}", .{l.id}) catch continue);
+            },
+            .none => {},
+        }
     }
 
     fn exec(self: *Console, line: []const u8) void {
@@ -320,8 +488,7 @@ const Console = struct {
         } else if (eql(cmd, "save")) {
             self.save(at(args, 0) orelse self.config_path orelse "zunnel.conf");
         } else if (eql(cmd, "exit") or eql(cmd, "quit")) {
-            self.server.shutdown();
-            std.process.exit(0);
+            quit();
         } else {
             std.debug.print("unknown command '{s}', try 'help'\n", .{cmd});
         }
@@ -777,4 +944,5 @@ fn eql(a: []const u8, b: []const u8) bool {
 test {
     _ = @import("packet.zig");
     _ = @import("tun.zig");
+    _ = @import("lineedit.zig");
 }

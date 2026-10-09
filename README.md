@@ -101,6 +101,16 @@ zunnel> ifaces                                     # interfaces, agents, routes,
 Wherever a command takes an `<agent>`, use its session number or a unique prefix of its IDENT, a
 stable id derived from the agent's host and user.
 
+In a terminal the console has line editing:
+- **Tab** completes commands, interface names, agent ids and IDENTs, and listener ids.
+- **↑/↓** browse history, which is kept in `~/.zunnel_history`.
+- **←/→, Home/End, Delete, Ctrl-A/E/U/K/W** edit the line, **Ctrl-L** clears the screen, and
+  **Ctrl-D** on an empty line exits (**Ctrl-C** shuts down cleanly too).
+
+Messages that arrive while you type, such as an agent joining, are printed above your input line
+without disturbing it. With piped or redirected input the console falls back to plain line
+reading.
+
 ### Seeing what's going on
 
 ```
@@ -286,6 +296,8 @@ translates the result back into packets:
   and listeners that survive reconnects, `save` / `-config`
 - [x] P1 operations (part 2): agent `ifconfig` with route suggestions, `session info`, `flows` and
   byte counters, timestamped logging and `-log`
+- [x] P1 operations (part 3): console line editing, history, tab completion, and async output
+  that redraws around the input line
 
 ## Roadmap
 
@@ -300,8 +312,8 @@ translates the result back into packets:
 - [x] Agent `ifconfig` (interfaces, addresses, gateway, suggested routes) and `session info`.
 - [x] `flows [iface]` command, plus per-flow, per-interface and per-link byte counters.
 - [x] Timestamped (UTC) logging, `-log <file>`, `-v`/`-q`, and an event log (joins, leaves, routes, listeners).
-- [ ] Console line editing, history and tab completion.
-- [ ] Console output that doesn't interleave with the prompt.
+- [x] Console line editing, history and tab completion.
+- [x] Console output that doesn't interleave with the prompt.
 
 ### P2: transports and evasion
 - [ ] Alternate transports: TLS (looks like HTTPS) and WebSocket. Agent support for HTTP CONNECT

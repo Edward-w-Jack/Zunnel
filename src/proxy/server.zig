@@ -340,7 +340,10 @@ pub const Server = struct {
         };
         const uplink: ?[4]u8 = if (s.remote.any.family == std.posix.AF.INET) std.mem.asBytes(&s.remote.in.sa.addr).* else null;
 
-        std.debug.print("\n[*] agent #{d} ({s}@{s}) interfaces:\n", .{ s.id, s.user, s.hostname });
+        // Built in full and printed at once, so it does not interleave with typing.
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        out.print(self.gpa, "[*] agent #{d} ({s}@{s}) interfaces:\n", .{ s.id, s.user, s.hostname }) catch {};
         var suggestions: std.ArrayList(u8) = .empty;
         defer suggestions.deinit(self.gpa);
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
@@ -349,11 +352,11 @@ pub const Server = struct {
             const key = line[0..eq];
             const value = line[eq + 1 ..];
             if (std.mem.eql(u8, key, "gateway")) {
-                std.debug.print("      default gateway {s}\n", .{value});
+                out.print(self.gpa, "      default gateway {s}\n", .{value}) catch {};
                 continue;
             }
             if (!std.mem.eql(u8, key, "iface")) {
-                std.debug.print("      {s}\n", .{line});
+                out.print(self.gpa, "      {s}\n", .{line}) catch {};
                 continue;
             }
             // "iface=<name with spaces> <addr>/<len> ..." - addresses contain '/'.
@@ -364,10 +367,10 @@ pub const Server = struct {
                 break;
             };
             const name = std.mem.trim(u8, value[0..first_addr], " ");
-            std.debug.print("  {s}\n", .{name});
+            out.print(self.gpa, "  {s}\n", .{name}) catch {};
             var addrs = std.mem.tokenizeScalar(u8, value[first_addr..], ' ');
             while (addrs.next()) |a| {
-                std.debug.print("      {s}\n", .{a});
+                out.print(self.gpa, "      {s}\n", .{a}) catch {};
                 const net = tun.Cidr.parse(a) catch continue; // IPv6 addresses are skipped here
                 const ip = std.mem.toBytes(std.mem.nativeToBig(u32, net.net));
                 if (net.mask == 0xffffffff or ip[0] == 127 or (ip[0] == 169 and ip[1] == 254)) continue;
@@ -377,7 +380,8 @@ pub const Server = struct {
                 } else suggestions.print(self.gpa, "      route add {f} {s}\n", .{ net, iface }) catch {};
             }
         }
-        if (suggestions.items.len > 0) std.debug.print("  networks this agent can reach:\n{s}", .{suggestions.items});
+        if (suggestions.items.len > 0) out.print(self.gpa, "  networks this agent can reach:\n{s}", .{suggestions.items}) catch {};
+        ui.out(out.items);
     }
 
     fn onAccepted(self: *Server, s: *Session, frame: common.link.Frame) void {
