@@ -24,6 +24,11 @@ pub const Session = struct {
     os: []const u8 = "?",
     arch: []const u8 = "?",
     version: []const u8 = "?",
+    /// Stable, host-derived agent identity (survives reconnects).
+    ident: []const u8 = "?",
+    pid: []const u8 = "?",
+    /// Agent's self-destruct deadline (Unix ms), if it has one.
+    expire_ms: ?i64 = null,
     /// Upstream agent this session was relayed through (see `relay` command).
     via: ?u32 = null,
     /// Flows accepted by this agent's listeners, dialed on the proxy side.
@@ -42,6 +47,9 @@ pub const Session = struct {
             if (std.mem.eql(u8, key, "os")) self.os = value;
             if (std.mem.eql(u8, key, "arch")) self.arch = value;
             if (std.mem.eql(u8, key, "version")) self.version = value;
+            if (std.mem.eql(u8, key, "id")) self.ident = value;
+            if (std.mem.eql(u8, key, "pid")) self.pid = value;
+            if (std.mem.eql(u8, key, "expire")) self.expire_ms = std.fmt.parseInt(i64, value, 10) catch null;
         }
     }
 };

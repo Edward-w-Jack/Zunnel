@@ -192,9 +192,11 @@ const help_text =
     \\  listeners                                  list listeners
     \\  relay <agent> [bind]                       let deeper agents connect through
     \\                                             <agent> (default bind 0.0.0.0:11601)
+    \\  kill <agent>                               shut an agent down for good (no reconnect)
     \\  exit                                       quit
     \\
     \\  [iface] defaults to the -tun name; [agent] defaults to the only agent.
+    \\  <agent> is a session number or a unique prefix of the agent's IDENT.
     \\
 ;
 
@@ -249,6 +251,8 @@ const Console = struct {
             self.listener(args);
         } else if (eql(cmd, "relay")) {
             self.relay(at(args, 0), at(args, 1));
+        } else if (eql(cmd, "kill")) {
+            self.kill(at(args, 0));
         } else if (eql(cmd, "exit") or eql(cmd, "quit")) {
             self.server.shutdown();
             std.process.exit(0);
@@ -264,7 +268,7 @@ const Console = struct {
         server.mutex.lock();
         defer server.mutex.unlock();
         if (server.sessions.items.len == 0) return std.debug.print("no agents connected\n", .{});
-        std.debug.print("  {s:<4} {s:<28} {s:<16} {s:<22} {s}\n", .{ "ID", "AGENT", "OS", "REMOTE", "TUNNELS" });
+        std.debug.print("  {s:<4} {s:<16} {s:<28} {s:<16} {s:<22} {s}\n", .{ "ID", "IDENT", "AGENT", "OS", "REMOTE", "TUNNELS" });
         for (server.sessions.items) |s| {
             var name_buf: [64]u8 = undefined;
             var os_buf: [32]u8 = undefined;
@@ -278,20 +282,34 @@ const Console = struct {
                 std.fmt.bufPrint(&remote_buf, "{f}", .{s.remote}) catch "?";
             var w = std.Io.Writer.fixed(&ifaces_buf);
             for (server.tunnels.items) |t| if (t.activeSession() == s) w.print("{s} ", .{t.name}) catch {};
-            std.debug.print("  {d:<4} {s:<28} {s:<16} {s:<22} {s}\n", .{ s.id, agent_name, os, remote, w.buffered() });
+            std.debug.print("  {d:<4} {s:<16} {s:<28} {s:<16} {s:<22} {s}\n", .{ s.id, s.ident, agent_name, os, remote, w.buffered() });
+            if (s.expire_ms) |deadline| {
+                const left: u64 = @intCast(@max(0, @divTrunc(deadline - std.time.milliTimestamp(), 1000)));
+                std.debug.print("       expires in {d}h{d:0>2}m{d:0>2}s\n", .{ left / 3600, left % 3600 / 60, left % 60 });
+            }
         }
     }
 
-    /// Resolves an agent id argument (or the only agent). Caller holds server.mutex.
+    /// Resolves an agent argument: a session number (`3`, `#3`), a unique
+    /// prefix of an agent identity, or nothing (the only agent). Caller holds
+    /// server.mutex.
     fn resolveAgentLocked(self: *Console, id_arg: ?[]const u8) ?*Session {
         const sessions = self.server.sessions.items;
         if (id_arg) |a| {
-            const id = std.fmt.parseInt(u32, std.mem.trimLeft(u8, a, "#"), 10) catch {
-                std.debug.print("invalid agent id '{s}'\n", .{a});
-                return null;
-            };
-            return self.server.findSessionLocked(id) orelse {
-                std.debug.print("no agent #{d}\n", .{id});
+            if (std.fmt.parseInt(u32, std.mem.trimLeft(u8, a, "#"), 10)) |id| {
+                if (self.server.findSessionLocked(id)) |s| return s;
+            } else |_| {}
+            var found: ?*Session = null;
+            for (sessions) |s| {
+                if (!std.mem.startsWith(u8, s.ident, a)) continue;
+                if (found != null) {
+                    std.debug.print("'{s}' matches more than one agent; use more of the identity\n", .{a});
+                    return null;
+                }
+                found = s;
+            }
+            return found orelse {
+                std.debug.print("no agent '{s}'\n", .{a});
                 return null;
             };
         }
@@ -300,6 +318,16 @@ const Console = struct {
             return null;
         }
         return sessions[0];
+    }
+
+    /// Tells an agent to shut down for good; it will not reconnect.
+    fn kill(self: *Console, agent_arg: ?[]const u8) void {
+        const arg = agent_arg orelse return std.debug.print("usage: kill <agent>\n", .{});
+        self.server.mutex.lock();
+        defer self.server.mutex.unlock();
+        const s = self.resolveAgentLocked(arg) orelse return;
+        s.link.send(.kill, 0, &.{}) catch return std.debug.print("agent #{d} is already disconnecting\n", .{s.id});
+        std.debug.print("sent kill to agent #{d} ({s}@{s}); it will not reconnect\n", .{ s.id, s.user, s.hostname });
     }
 
     // ------------------------------------------------------------ tunnels
