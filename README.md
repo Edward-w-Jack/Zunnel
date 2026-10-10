@@ -282,6 +282,9 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
   used to allocate ~750 MB of stack across threads; it now sits at a handful of threads total.
   The thread sleeps while nothing happens, and a connection's socket is closed as soon as both
   directions have finished or either side resets.
+- **Backpressure:** a receiver slower than the tunnel slows the sender down through the per-flow
+  credit window instead of getting its connection reset. A socket error ends only the connection
+  it happened on, never the agent or proxy.
 - **Bounded handshakes:** at most 64 handshakes are in progress (8 per source address), each with a
   10 s timeout.
 - **Monotonic timers:** heartbeats and every connection timeout run on a monotonic clock, so
@@ -346,7 +349,8 @@ translates the result back into packets:
   thread model with one `poll`/`WSAPoll` thread per link
 - [x] P3 review fixes: finished and reset connections are released at once (the relay thread
   no longer spins on their sockets), reads on drained Windows sockets no longer reset the flow,
-  and aborted dials return their slot
+  aborted dials return their slot, slow receivers get backpressure instead of a reset, and send
+  and connect errors that Zig's std wrappers treat as impossible no longer crash the process
 
 ## Roadmap
 

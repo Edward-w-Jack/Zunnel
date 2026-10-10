@@ -14,6 +14,8 @@ pub const Handle = std.net.Stream.Handle;
 /// non-blocking socket would block (POSIX reports both as EAGAIN).
 pub const RecvError = error{ Timeout, ConnectionReset, RecvFailed };
 pub const SendError = error{ ConnectionReset, SendFailed };
+/// `WouldBlock`: a non-blocking socket's send buffer is full.
+pub const SendNowError = SendError || error{WouldBlock};
 
 /// Returns 0 on orderly shutdown by the peer.
 pub fn recv(h: Handle, buf: []u8) RecvError!usize {
@@ -44,18 +46,22 @@ pub fn recvExact(h: Handle, buf: []u8) (RecvError || error{EndOfStream})!void {
     }
 }
 
-pub fn send(h: Handle, data: []const u8) SendError!usize {
+pub fn send(h: Handle, data: []const u8) SendNowError!usize {
     if (is_windows) {
         const len: i32 = @intCast(@min(data.len, std.math.maxInt(i32)));
         const n = ws2.send(h, data.ptr, len, 0);
         if (n == ws2.SOCKET_ERROR) return switch (ws2.WSAGetLastError()) {
+            .WSAEWOULDBLOCK => error.WouldBlock,
             .WSAECONNRESET, .WSAECONNABORTED, .WSAESHUTDOWN => error.ConnectionReset,
             else => error.SendFailed,
         };
         return @intCast(n);
     }
+    // Not std.posix.send: it treats EHOSTUNREACH, ENETUNREACH and ENOTCONN
+    // as unreachable, and Linux returns them on a dead connection's next send.
     const flags: u32 = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
-    return posix.send(h, data, flags) catch |err| switch (err) {
+    return posix.sendto(h, data, flags, null, 0) catch |err| switch (err) {
+        error.WouldBlock => error.WouldBlock,
         error.ConnectionResetByPeer, error.BrokenPipe => error.ConnectionReset,
         else => error.SendFailed,
     };
@@ -63,7 +69,11 @@ pub fn send(h: Handle, data: []const u8) SendError!usize {
 
 pub fn sendAll(h: Handle, data: []const u8) SendError!void {
     var off: usize = 0;
-    while (off < data.len) off += try send(h, data[off..]);
+    while (off < data.len) off += send(h, data[off..]) catch |err| return switch (err) {
+        // A blocking socket only "would block" once its send timeout expires.
+        error.WouldBlock, error.SendFailed => error.SendFailed,
+        error.ConnectionReset => error.ConnectionReset,
+    };
 }
 
 /// Returns the first byte that is already in the OS receive buffer, without
@@ -354,6 +364,39 @@ pub fn localAddress(h: Handle) ?std.net.Address {
 pub fn udpConnect(addr: std.net.Address) !Handle {
     const h = try posix.socket(addr.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
     errdefer close(h);
-    try posix.connect(h, &addr.any, addr.getOsSockLen());
+    try connect(h, addr);
     return h;
+}
+
+/// Connects `h` to `addr`. On a non-blocking socket, error.WouldBlock means
+/// the connect is in progress: wait until writable, then read SO_ERROR.
+/// Unlike std.posix.connect, this never panics on an error the network or
+/// the host can produce (Zig 0.15.2 treats WSAEACCES as unreachable).
+pub fn connect(h: Handle, addr: std.net.Address) (ConnectError || error{WouldBlock})!void {
+    if (is_windows) {
+        if (ws2.connect(h, &addr.any, @intCast(addr.getOsSockLen())) == ws2.SOCKET_ERROR) {
+            return switch (ws2.WSAGetLastError()) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                else => |e| mapWsaConnectError(@intFromEnum(e)),
+            };
+        }
+        return;
+    }
+    posix.connect(h, &addr.any, addr.getOsSockLen()) catch |err| return switch (err) {
+        error.WouldBlock => error.WouldBlock,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+        error.ConnectionTimedOut => error.ConnectionTimedOut,
+        else => error.ConnectFailed,
+    };
+}
+
+test "send fails cleanly where std.posix.send would panic" {
+    if (is_windows) return error.SkipZigTest;
+    // An unconnected stream socket fails send with ENOTCONN, which
+    // std.posix.send (like EHOSTUNREACH and ENETUNREACH) maps to unreachable.
+    const h = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer close(h);
+    try std.testing.expectError(error.SendFailed, send(h, "x"));
 }

@@ -550,7 +550,13 @@ fn tcpRead(table: *Table, flow: *Flow) void {
 fn tcpWrite(table: *Table, flow: *Flow) void {
     const h = flow.handle orelse return;
     while (flow.inbox.items.len > 0) {
-        const n = sock.send(h, flow.inbox.items) catch return flow.abortLocked(true);
+        const n = sock.send(h, flow.inbox.items) catch |err| switch (err) {
+            // The target reads slower than the peer sends: keep the rest and
+            // wait for writability. Credit stays withheld meanwhile, so the
+            // peer slows down instead of the connection being reset.
+            error.WouldBlock => break,
+            else => return flow.abortLocked(true),
+        };
         if (n == 0) break;
         const rest = flow.inbox.items.len - n;
         if (rest > 0) std.mem.copyForwards(u8, flow.inbox.items[0..rest], flow.inbox.items[n..]);
@@ -620,8 +626,8 @@ fn tcpStartConnect(flow: *Flow) void {
         sock.close(h);
         return failDial(flow, .other);
     };
-    posix.connect(h, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-        error.WouldBlock => {}, // normal
+    sock.connect(h, addr) catch |err| switch (err) {
+        error.WouldBlock => {}, // in progress; the reactor reports the outcome
         else => {
             sock.close(h);
             return failDial(flow, proto.FailReason.fromError(err));
@@ -793,6 +799,19 @@ fn listenLocal() !std.net.Server {
     return sock.listenTcp(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0), 8);
 }
 
+/// Shrinks the receive buffer of sockets accepted from listener `h` (set
+/// before the handshake, so the advertised window starts small and the OS
+/// doesn't auto-tune it).
+fn setSmallRecvBuffer(h: sock.Handle) void {
+    const size: i32 = 4096;
+    if (is_windows) {
+        const ws2 = std.os.windows.ws2_32;
+        _ = ws2.setsockopt(h, ws2.SOL.SOCKET, ws2.SO.RCVBUF, std.mem.asBytes(&size), @sizeOf(i32));
+    } else {
+        posix.setsockopt(h, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
+    }
+}
+
 /// Accepts the Table's connection to `l`. Reads on it time out, so a missing
 /// byte fails the test instead of hanging it.
 fn acceptTarget(l: *std.net.Server) !sock.Handle {
@@ -919,6 +938,79 @@ test "relay: UDP to a closed port reports unreachable and goes idle" {
     h.feed(.data, 4, "anyone?");
     try h.expectNext(.icmp_unreachable, 4);
     try h.expectIdle();
+}
+
+/// Byte `i` of a test stream. Not periodic at 256, so a lost or repeated
+/// chunk shows up.
+fn patternByte(i: usize) u8 {
+    return @truncate(i ^ (i >> 8) ^ (i >> 16));
+}
+
+/// Reads a target socket to EOF, but only after stalling long enough for
+/// the socket buffers to fill.
+const SlowReader = struct {
+    handle: sock.Handle,
+    got: usize = 0,
+    bad: bool = false,
+
+    fn run(self: *SlowReader) void {
+        std.Thread.sleep(300 * std.time.ns_per_ms);
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = sock.recv(self.handle, &buf) catch return;
+            if (n == 0) return;
+            for (buf[0..n], self.got..) |b, i| {
+                if (b != patternByte(i)) self.bad = true;
+            }
+            self.got += n;
+        }
+    }
+};
+
+test "relay: a slow target gets everything, slowed by credit instead of reset" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var l = try listenLocal();
+    defer l.deinit();
+    setSmallRecvBuffer(l.stream.handle);
+
+    h.table.dial(6, .tcp, l.listen_address, 2000);
+    const target = try acceptTarget(&l);
+    defer sock.close(target);
+    try h.expectNext(.connect_ok, 6);
+
+    var reader: SlowReader = .{ .handle = target };
+    const t = try std.Thread.spawn(.{}, SlowReader.run, .{&reader});
+    var joined = false;
+    defer if (!joined) t.join(); // its reads time out after 3 s
+
+    // Far more than the socket buffers hold while the target stalls. Like a
+    // real peer, never send more than the credit the Table has granted.
+    const total: usize = 8 * 1024 * 1024;
+    var chunk: [32 * 1024]u8 = undefined;
+    var credit: u64 = proto.initial_window;
+    var sent: usize = 0;
+    while (sent < total) {
+        while (credit > 0 and sent < total) {
+            const n: usize = @intCast(@min(chunk.len, credit, total - sent));
+            for (chunk[0..n], sent..) |*b, i| b.* = patternByte(i);
+            h.feed(.data, 6, chunk[0..n]);
+            sent += n;
+            credit -= n;
+        }
+        const f = try h.next();
+        if (f.id != 6) continue;
+        switch (f.type) {
+            .window => credit += std.mem.readInt(u32, f.payload[0..4], .big),
+            .reset => return error.TestUnexpectedResult,
+            else => {},
+        }
+    }
+    h.feed(.fin, 6, &.{});
+    t.join();
+    joined = true;
+    try testing.expect(!reader.bad);
+    try testing.expectEqual(total, reader.got);
 }
 
 test "relay: a pending dial that is reset gives its slot back" {
