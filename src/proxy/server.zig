@@ -180,14 +180,21 @@ pub const Server = struct {
 
     fn sessionMain(self: *Server, conn: std.net.Server.Connection) void {
         var hello_buf: [common.link.max_hello_len]u8 = undefined;
-        const hs_result = common.link.serverHandshake(self.gpa, conn.stream.handle, self.static, self.psk, &hello_buf);
+        sock.setKeepAlive(conn.stream.handle);
+        sock.setNoDelay(conn.stream.handle);
+        const transport = common.stream.TcpStream.wrap(self.gpa, conn.stream.handle) catch {
+            self.endHandshake(conn.address);
+            conn.stream.close();
+            return;
+        };
+        const hs_result = common.link.serverHandshake(self.gpa, transport, self.static, self.psk, &hello_buf);
         self.endHandshake(conn.address);
         const hs = hs_result catch |err| {
             switch (err) {
                 error.AuthenticationFailed => log.warn("rejected agent {f}: wrong -secret (or an agent from a different zunnel version)", .{conn.address}),
                 else => log.warn("handshake with {f} failed: {s}", .{ conn.address, @errorName(err) }),
             }
-            conn.stream.close();
+            transport.close();
             return;
         };
         const s = self.gpa.create(Session) catch {

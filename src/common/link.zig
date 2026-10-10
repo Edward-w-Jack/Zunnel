@@ -1,7 +1,8 @@
 //! The encrypted, framed connection between proxy and agent.
 //!
-//! Handshake on a fresh TCP connection:
-//!   proxy -> agent : "ZNL1" | proxy static public key (32)
+//! Handshake on a fresh connection (over whatever `Stream` the caller passes:
+//! raw TCP today, TLS added in P2):
+//!   proxy -> agent : "ZNL5" | proxy static public key (32)
 //!   agent -> proxy : u16be len | Noise message 1 (payload: agent hello)
 //!   proxy -> agent : u16be len | Noise message 2
 //!
@@ -13,6 +14,9 @@ const clock = @import("clock.zig");
 const noise = @import("noise.zig");
 const proto = @import("proto.zig");
 const sock = @import("sock.zig");
+const stream_mod = @import("stream.zig");
+
+const Stream = stream_mod.Stream;
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.link);
@@ -32,7 +36,7 @@ pub const Frame = struct {
 
 pub const Link = struct {
     gpa: Allocator,
-    handle: sock.Handle,
+    stream: Stream,
     tx: noise.CipherState,
     rx: noise.CipherState,
 
@@ -52,13 +56,13 @@ pub const Link = struct {
     rx_pos: usize = 0,
     rx_len: usize = 0,
 
-    fn create(gpa: Allocator, handle: sock.Handle, t: noise.Transport) !*Link {
+    fn create(gpa: Allocator, s: Stream, t: noise.Transport) !*Link {
         const self = try gpa.create(Link);
-        self.* = .{ .gpa = gpa, .handle = handle, .tx = t.send, .rx = t.recv };
+        self.* = .{ .gpa = gpa, .stream = s, .tx = t.send, .rx = t.recv };
         self.last_rx.store(clock.monotonicMs(), .monotonic);
         errdefer gpa.destroy(self);
         // A peer that stops reading for this long is as dead as a silent one.
-        sock.setSendTimeout(handle, proto.link_dead_after_ms);
+        s.setSendTimeout(proto.link_dead_after_ms);
         self.writer = try std.Thread.spawn(.{}, writerLoop, .{self});
         return self;
     }
@@ -69,7 +73,7 @@ pub const Link = struct {
         self.close();
         if (self.writer) |t| t.join();
         self.queue.deinit(self.gpa);
-        sock.close(self.handle);
+        self.stream.close();
         self.gpa.destroy(self);
     }
 
@@ -83,7 +87,7 @@ pub const Link = struct {
     fn closeLocked(self: *Link) void {
         if (self.closed) return;
         self.closed = true;
-        sock.shutdown(self.handle, .both);
+        self.stream.shutdown(.both);
         self.cond.broadcast();
     }
 
@@ -178,7 +182,7 @@ pub const Link = struct {
                     self.close();
                     return;
                 };
-                sock.sendAll(self.handle, out[0 .. 2 + ct_len]) catch {
+                self.stream.sendAll(out[0 .. 2 + ct_len]) catch {
                     self.close();
                     return;
                 };
@@ -201,10 +205,10 @@ pub const Link = struct {
 
     fn readRecord(self: *Link) !void {
         var lb: [2]u8 = undefined;
-        try sock.recvExact(self.handle, &lb);
+        try self.stream.recvExact(&lb);
         const len = std.mem.readInt(u16, &lb, .big);
         if (len <= noise.tag_len or len > max_record) return error.InvalidMessage;
-        try sock.recvExact(self.handle, self.rx_buf[0..len]);
+        try self.stream.recvExact(self.rx_buf[0..len]);
         const plain_len = len - noise.tag_len;
         try self.rx.decrypt(self.rx_buf[0..plain_len], "", self.rx_buf[0..len]);
         self.rx_pos = 0;
@@ -255,19 +259,19 @@ test "fuzz parseFrame" {
     } });
 }
 
-fn sendMsg(h: sock.Handle, msg: []const u8) !void {
+fn sendMsg(s: Stream, msg: []const u8) !void {
     var lb: [2]u8 = undefined;
     std.mem.writeInt(u16, &lb, @intCast(msg.len), .big);
-    try sock.sendAll(h, &lb);
-    try sock.sendAll(h, msg);
+    try s.sendAll(&lb);
+    try s.sendAll(msg);
 }
 
-fn recvMsg(h: sock.Handle, buf: []u8) ![]u8 {
+fn recvMsg(s: Stream, buf: []u8) ![]u8 {
     var lb: [2]u8 = undefined;
-    try sock.recvExact(h, &lb);
+    try s.recvExact(&lb);
     const len = std.mem.readInt(u16, &lb, .big);
     if (len > buf.len) return error.InvalidMessage;
-    try sock.recvExact(h, buf[0..len]);
+    try s.recvExact(buf[0..len]);
     return buf[0..len];
 }
 
@@ -277,17 +281,17 @@ pub const ClientResult = struct {
 };
 
 /// Agent side. `expected_key` == null accepts any proxy key (caller should show
-/// the fingerprint). On success the link owns `handle`.
+/// the fingerprint). On success the link owns `s`.
 pub fn clientHandshake(
     gpa: Allocator,
-    handle: sock.Handle,
+    s: Stream,
     expected_key: ?[noise.key_len]u8,
     psk: [noise.key_len]u8,
     hello: []const u8,
 ) !ClientResult {
-    sock.setRecvTimeout(handle, handshake_timeout_ms);
+    s.setRecvTimeout(handshake_timeout_ms);
     var pre: [proto.magic.len + noise.key_len]u8 = undefined;
-    try sock.recvExact(handle, &pre);
+    try s.recvExact(&pre);
     if (!std.mem.eql(u8, pre[0..proto.magic.len], proto.magic)) {
         std.log.err("expected protocol {s}, proxy sent {any}", .{ proto.magic, pre[0..proto.magic.len] });
         return error.ProtocolMismatch;
@@ -299,15 +303,13 @@ pub fn clientHandshake(
 
     var hs = noise.Initiator.init(server_key, psk, proto.magic);
     var buf: [max_hello + 64]u8 = undefined;
-    try sendMsg(handle, try hs.writeMessage1(&buf, hello[0..@min(hello.len, max_hello)]));
+    try sendMsg(s, try hs.writeMessage1(&buf, hello[0..@min(hello.len, max_hello)]));
 
     var payload: [64]u8 = undefined;
-    const msg2 = try recvMsg(handle, &buf);
+    const msg2 = try recvMsg(s, &buf);
     const transport, _ = try hs.readMessage2(msg2, &payload);
-    sock.setRecvTimeout(handle, 0);
-    sock.setKeepAlive(handle);
-    sock.setNoDelay(handle);
-    return .{ .link = try Link.create(gpa, handle, transport), .server_key = server_key };
+    s.setRecvTimeout(0);
+    return .{ .link = try Link.create(gpa, s, transport), .server_key = server_key };
 }
 
 pub const ServerResult = struct {
@@ -315,29 +317,27 @@ pub const ServerResult = struct {
     hello: []u8,
 };
 
-/// Proxy side. On success the link owns `handle` and `hello` points into `hello_buf`.
+/// Proxy side. On success the link owns `s` and `hello` points into `hello_buf`.
 pub fn serverHandshake(
     gpa: Allocator,
-    handle: sock.Handle,
+    s: Stream,
     static: noise.KeyPair,
     psk: [noise.key_len]u8,
     hello_buf: *[max_hello]u8,
 ) !ServerResult {
-    sock.setRecvTimeout(handle, handshake_timeout_ms);
-    try sock.sendAll(handle, proto.magic ++ static.public_key);
+    s.setRecvTimeout(handshake_timeout_ms);
+    try s.sendAll(proto.magic ++ static.public_key);
 
     var hs = noise.Responder.init(static, psk, proto.magic);
     var buf: [max_hello + 64]u8 = undefined;
-    const msg1 = try recvMsg(handle, &buf);
+    const msg1 = try recvMsg(s, &buf);
     const hello = try hs.readMessage1(msg1, hello_buf);
 
     var out: [64]u8 = undefined;
     const transport, const msg2 = try hs.writeMessage2(&out, "");
-    try sendMsg(handle, msg2);
-    sock.setRecvTimeout(handle, 0);
-    sock.setKeepAlive(handle);
-    sock.setNoDelay(handle);
-    return .{ .link = try Link.create(gpa, handle, transport), .hello = hello };
+    try sendMsg(s, msg2);
+    s.setRecvTimeout(0);
+    return .{ .link = try Link.create(gpa, s, transport), .hello = hello };
 }
 
 pub const max_hello_len = max_hello;

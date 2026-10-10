@@ -133,9 +133,15 @@ const SessionEnd = enum(u8) { disconnected, killed, expired, stopped };
 
 fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop: *std.atomic.Value(bool)) !SessionEnd {
     log.info("connecting to {s}:{d}", .{ cfg.host, cfg.port });
-    const stream = try std.net.tcpConnectToHost(gpa, cfg.host, cfg.port);
-    const res = common.link.clientHandshake(gpa, stream.handle, cfg.pubkey, psk, hello) catch |err| {
-        stream.close();
+    const tcp = try std.net.tcpConnectToHost(gpa, cfg.host, cfg.port);
+    common.sock.setKeepAlive(tcp.handle);
+    common.sock.setNoDelay(tcp.handle);
+    const transport = common.stream.TcpStream.wrap(gpa, tcp.handle) catch |err| {
+        tcp.close();
+        return err;
+    };
+    const res = common.link.clientHandshake(gpa, transport, cfg.pubkey, psk, hello) catch |err| {
+        transport.close();
         return err;
     };
     if (cfg.pubkey == null) log.warn("insecure mode: proxy key is {s}", .{&keys.encode(res.server_key)});
@@ -313,8 +319,12 @@ const FakeProxy = struct {
         const conn = try self.listener.accept();
         var hello_buf: [common.link.max_hello_len]u8 = undefined;
         const psk = common.noise.pskFromSecret("s3cret");
-        const hs = common.link.serverHandshake(std.testing.allocator, conn.stream.handle, self.key, psk, &hello_buf) catch |err| {
+        const transport = common.stream.TcpStream.wrap(std.testing.allocator, conn.stream.handle) catch |err| {
             conn.stream.close();
+            return err;
+        };
+        const hs = common.link.serverHandshake(std.testing.allocator, transport, self.key, psk, &hello_buf) catch |err| {
+            transport.close();
             return err;
         };
         defer hs.link.destroy();

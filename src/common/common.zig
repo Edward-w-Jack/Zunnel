@@ -1,6 +1,7 @@
 pub const noise = @import("noise.zig");
 pub const proto = @import("proto.zig");
 pub const sock = @import("sock.zig");
+pub const stream = @import("stream.zig");
 pub const link = @import("link.zig");
 pub const keys = @import("keys.zig");
 pub const relay = @import("relay.zig");
