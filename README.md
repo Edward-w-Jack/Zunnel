@@ -1,41 +1,106 @@
 # zunnel
 
-A ligolo-style tunnelling tool written in Zig. An unprivileged **agent** on a remote host
-connects back to the **proxy** on your machine; the proxy exposes a TUN interface so you can
-reach the agent's networks with ordinary tools (nmap -sT, ssh, curl, smbclient, ...),
-with no SOCKS and no proxychains.
+zunnel is a high-performance, ultra-lightweight tool for cross-platform network tunnelling and
+pivoting, written in Zig. An unprivileged **agent** on a remote host connects back to the
+**server** on your machine. The server exposes a real TUN interface, so you reach the agent's
+networks with ordinary tools (nmap, ssh, curl, smbclient, ...), with no SOCKS and no
+proxychains.
+
+- **Fast:** over 1 Gbps of throughput through the tunnel.
+- **Small:** the agent is a single static binary of about 820 KB (x86_64 Linux, `ReleaseSafe`).
+  It needs no runtime, no libc and no installer.
+- **Idle means idle:** 0.0% CPU and negligible memory when no traffic is flowing.
+- **True Layer 3:** the server terminates traffic in lwIP behind a TUN interface. Your tools
+  therefore send raw IP packets (SYN scans, ICMP, arbitrary UDP) straight into the tunnel,
+  instead of being squeezed through a user-space SOCKS proxy. On the far side, the agent turns
+  each flow into ordinary socket calls, so it never needs privileges.
 
 ```
  your tools ──► TUN (zunnel) ──► lwIP netstack ──► Noise link ──► agent ──► target network
-                 proxy (root/admin)                             (no privileges)
+                 server (root/admin)                             (no privileges)
 ```
+
+## Project origins & AI collaboration
+
+zunnel's foundational architecture and initial v1 codebase were generated in collaboration with
+Claude, Anthropic's AI model. This was a deliberate strategy. A TUN-backed pivoting tool spans:
+
+- a user-space TCP stack,
+- an authenticated, encrypted transport,
+- a multiplexed protocol with flow control,
+- an event-driven socket relay, on two operating systems.
+
+Building it with an AI let me model that whole stack in Zig quickly. I got a working, testable
+system to study and take apart, instead of spending months on scaffolding.
+
+The design decisions were mine: Linux and Windows TUN support, an agent that never needs
+privileges, Noise inside TLS 1.3, and lwIP pulled in through the Zig package manager. The work
+went phase by phase. Each phase landed as its own commit with unit tests, and was exercised in a
+Windows and Linux lab.
+
+### Background
+
+I'm not a developer by trade. My programming background is a little C and C++. With zunnel I want to learn how bigger applications are built: how a system with many moving parts is structured, how
+those parts talk to each other, and how it is tested and grown over time.
+
+I picked Zig because it looked interesting, it has no garbage collector, and its build system is
+a pleasure to use. zunnel is also how I'm learning it:
+
+- **Memory management:** explicit allocation through `std.mem.Allocator`, with no hidden heap.
+- **C interop:** the Zig build system compiles lwIP and mbedTLS, and Zig drives them through
+  `@cImport`. The Windows TUN goes through Wintun's C API.
+- **Cross-compilation:** one `build.zig` produces the Linux and Windows binaries from either
+  host.
+
+### The manual roadmap
+
+I plan to implement some of the remaining [P3](#p3-protocol-coverage-and-scale) work by hand, to
+learn systems programming. I don't want to depend on AI to work on my own projects, so these are
+the parts I mean to write myself:
+
+- **Native IPv6:** parsing and handling across the TUN, the lwIP stack and the relay.
+- **Robust fragment reassembly:** taking the current IPv4 implementation to a hardened,
+  dual-stack (IPv4 and IPv6) one.
+- **Zero-copy pipeline and native event loops:** refactoring the packet path toward zero-copy,
+  and moving the relay from portable `poll`/`WSAPoll` to epoll on Linux and IOCP on Windows.
+
+The v1 codebase is the baseline; the hand-written work starts here.
 
 ## How it works
 
-- **Proxy** (`zunnel-proxy`, Linux and Windows) reads raw IP packets from the TUN device.
-  - **TCP** is terminated by [lwIP](https://savannah.nongnu.org/projects/lwip/). The proxy
+- **Server** (`zunnel-server`, Linux and Windows) reads raw IP packets from the TUN device.
+  - **TCP** is terminated by [lwIP](https://savannah.nongnu.org/projects/lwip/). The server
     holds each client SYN until the agent's real `connect()` succeeds, then replays it into
     lwIP. A failed dial is answered with RST, so port scans report accurate open/closed results.
   - **UDP** is relayed per flow (DNS works) without going through lwIP.
   - **ICMP echo**: the agent pings the target (no privileges needed: `IcmpSendEcho` on
-    Windows; unprivileged ICMP sockets or the `ping` binary elsewhere). The proxy answers
+    Windows; unprivileged ICMP sockets or the `ping` binary elsewhere). The server answers
     only if the target replied, so `ping` and nmap host discovery work.
   - Several TUN interfaces can run at once, each routed through a different agent. They all
     share one lwIP stack.
 - **Agent** (`zunnel-agent`, any OS Zig targets, no libc) dials each flow with normal sockets.
-  Destinations in the proxy's `-localhost-net` (default `240.0.0.0/4`) reach the agent's
+  Destinations in the server's `-localhost-net` (default `240.0.0.0/4`) reach the agent's
   own `127.0.0.1`.
+  > **macOS is untested:** the agent has macOS code paths (interface listing, ping, machine ID),
+  > but I don't own a Mac and have never run it there, so I have no proof or idea whether it
+  > actually works. Only Linux and Windows have been tested.
 - **Listeners** open a TCP or UDP port on an agent. Each connection is relayed back and dialed
-  from the proxy host, e.g. for reverse shells, file transfers, or relays.
-- **Relays** (multi-hop): `relay <agent>` exposes the proxy's own port on that agent, so a deeper
+  from the server host, e.g. for reverse shells, file transfers, or relays.
+- **Relays** (multi-hop): `relay <agent>` exposes the server's own port on that agent, so a deeper
   agent can connect through it. Each hop is its own end-to-end encrypted session and can drive
   its own TUN interface.
-- **Link** is a single TCP connection secured with
-  `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s` (pure `std.crypto`). The agent pins the proxy's
-  public key, and an optional shared secret authenticates the agent. Flows are multiplexed
-  with per-flow, credit-based flow control.
+- **Link** is a single TCP connection, wrapped in TLS 1.3 by default (`-no-tls` turns that off),
+  that carries a `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s` session (`std.crypto`). The agent pins
+  the server's public key, and the shared secret (on by default) authenticates the agent. Flows
+  are multiplexed with per-flow, credit-based flow control.
 - lwIP is fetched by the Zig package manager. Three one-line patches, applied at build time
   by `tools/patch.zig`, make it accept any destination IP and port.
+
+Developer documentation lives in [`docs/`](docs/README.md):
+
+- [architecture](docs/architecture.md): components, threads, the packet path, the relay
+- [protocol](docs/protocol.md): the link wire format
+- [file map](docs/files.md): what each source file handles
 
 ## Build
 
@@ -54,20 +119,20 @@ Binaries go to `zig-out/bin/` (use `--prefix zig-out/<name>` to keep per-target 
 / `ReleaseFast` remove the bounds and overflow checks that turn parser bugs into clean crashes
 instead of memory corruption. The frame parser, message decoders, packet parsers and handshake
 reader all have fuzz tests. Fuzzing has its own step because Zig 0.15's experimental fuzzer
-can't instrument the proxy test binary (it links libc and lwIP); `zig build fuzz` builds only the
+can't instrument the server test binary (it links libc and lwIP); `zig build fuzz` builds only the
 pure-Zig parsers. Run it as a normal user, not with `sudo`.
 
 ## Privileges
 
-| | Proxy (operator machine) | Agent (target) |
+| | Server (operator machine) | Agent (target) |
 |---|---|---|
 | Needs root / Administrator | **Yes**: it creates the TUN interface | **No, never** |
 | Needs `wintun.dll` | Yes, on Windows | **No** |
-| Files to deploy | `zunnel-proxy` (+ `wintun.dll` on Windows) | the single `zunnel-agent` binary |
+| Files to deploy | `zunnel-server` (+ `wintun.dll` on Windows) | the single `zunnel-agent` binary |
 
-The proxy always runs elevated with a TUN, and refuses to start otherwise (on Windows it also
+The server always runs elevated with a TUN, and refuses to start otherwise (on Windows it also
 checks for `wintun.dll`). On Linux, a TUN pre-created for your user (`sudo ip tuntap add user
-$USER mode tun <name>`) also works. The agent is a multiplexer that turns proxy requests
+$USER mode tun <name>`) also works. The agent is a multiplexer that turns server requests
 into ordinary socket calls (`connect`, `send`, `recv`), so it works as any normal user. Without
 privileges, the agent has these limits:
 
@@ -80,13 +145,13 @@ privileges, the agent has these limits:
 
 ```sh
 # operator machine (root, or a pre-created TUN: sudo ip tuntap add user $USER mode tun zunnel)
-zunnel-proxy -route 10.10.0.0/16 -autostart
+zunnel-server -route 10.10.0.0/16 -autostart
 
-# remote host: copy the agent command the proxy prints (it includes the key and secret)
-zunnel-agent -connect proxy.example.com:11601 -pubkey <key> -secret <secret> -retry
+# remote host: copy the agent command the server prints (it includes the key and secret)
+zunnel-agent -connect server.example.com:11601 -pubkey <key> -secret <secret> -retry
 ```
 
-On first run the proxy writes `zunnel.key`, which holds its private key and a generated shared
+On first run the server writes `zunnel.key`, which holds its private key and a generated shared
 secret, and `zunnel.cert` + `zunnel.cert.key`, a self-signed TLS certificate. The link is TLS 1.3
 by default: a new connection looks like HTTPS on the wire. `-no-tls` on both ends keeps raw TCP.
 The banner prints the full agent command and a matching baked-build command.
@@ -123,7 +188,7 @@ zunnel> ifaces                                     # per-interface totals and di
 ```
 
 `ifconfig` lists the networks the agent can reach as ready-to-run `route add` commands, and marks
-the one that carries the agent's own link to the proxy, which you must not route. Events (agents
+the one that carries the agent's own link to the server, which you must not route. Events (agents
 joining or leaving, routes, interfaces, bindings, listeners, `kill`) are printed with the time.
 `-log ops.log` also appends them, with full UTC timestamps, to a file.
 
@@ -145,7 +210,7 @@ zunnel> unbind dmz                                 # `stop dmz` detaches and unb
 zunnel> save ops.conf                              # interfaces, routes, bindings, listeners
 ```
 
-`save` writes the setup as console commands. Start the proxy with `-config ops.conf` to replay it;
+`save` writes the setup as console commands. Start the server with `-config ops.conf` to replay it;
 everything bound attaches as soon as its agents connect.
 
 ### Agent lifetime
@@ -165,7 +230,7 @@ zunnel> start 2 dmz
 zunnel> route add 172.16.0.0/16 dmz
 ```
 
-Listeners (connections to the agent's port are dialed from the proxy host):
+Listeners (connections to the agent's port are dialed from the server host):
 
 ```
 zunnel> listener add 1 tcp 0.0.0.0:4444 127.0.0.1:4444   # reverse shell catcher
@@ -174,7 +239,7 @@ zunnel> listeners
 zunnel> listener del 1
 ```
 
-Pivoting deeper: agent #1 can reach a network where agent #2 runs, but the proxy can't reach it:
+Pivoting deeper: agent #1 can reach a network where agent #2 runs, but the server can't reach it:
 
 ```
 zunnel> relay 1                                    # agent #1 listens on 0.0.0.0:11601
@@ -192,9 +257,9 @@ once for agent #2's own end-to-end session.
 the tunnel would cut that agent off. Append `force` to override.
 
 `exit`, Ctrl-C and SIGTERM shut down cleanly: routes, interfaces and firewall rules are removed and
-agents are disconnected (`-retry` agents reconnect when the proxy comes back).
+agents are disconnected (`-retry` agents reconnect when the server comes back).
 
-### Proxy options
+### Server options
 
 | Option | Default | |
 |---|---|---|
@@ -223,21 +288,21 @@ sensitive shows up in process listings.
 
 | Flag | Environment | Build option | |
 |---|---|---|---|
-| `-connect <host:port>` | `ZUNNEL_CONNECT` | `-Dagent-connect=` | proxy address |
-| `-pubkey <key>` | `ZUNNEL_PUBKEY` | `-Dagent-pubkey=` | expected proxy key |
+| `-connect <host:port>` | `ZUNNEL_CONNECT` | `-Dagent-connect=` | server address |
+| `-pubkey <key>` | `ZUNNEL_PUBKEY` | `-Dagent-pubkey=` | expected server key |
 | `-secret <s>` | `ZUNNEL_SECRET` | `-Dagent-secret=` | shared secret |
 | `-expire <when>` | `ZUNNEL_EXPIRE` | `-Dagent-expire=` | stop for good at a UTC time or after a duration |
 | `-id <id>` | `ZUNNEL_ID` | `-Dagent-id=` | override the host-derived IDENT |
 | `-retry` | | `-Dagent-retry=` | reconnect forever (on by default for baked agents) |
-| `-no-tls` | | `-Dagent-no-tls=` | use raw TCP; the proxy needs `-no-tls` too |
-| `-tls-verify` | | `-Dagent-tls-verify=` | require the proxy's TLS cert to match `-connect`'s host |
+| `-no-tls` | | `-Dagent-no-tls=` | use raw TCP; the server needs `-no-tls` too |
+| `-tls-verify` | | `-Dagent-tls-verify=` | require the server's TLS cert to match `-connect`'s host |
 | `-ca <file>` | `ZUNNEL_CA` | `-Dagent-ca=` | PEM CA bundle used with `-tls-verify` |
 | `-q` | | | print nothing |
 | `-v` | | | verbose: also log each failed dial and port-unreachable |
 
 ```sh
 zig build -Drelease -Dtarget=x86_64-windows --prefix zig-out/op1 \
-  -Dagent-connect=proxy.example.com:11601 -Dagent-pubkey=<key> -Dagent-secret=<secret> -Dagent-expire=7d
+  -Dagent-connect=server.example.com:11601 -Dagent-pubkey=<key> -Dagent-secret=<secret> -Dagent-expire=7d
 ```
 
 Two extra build options help deploy an unattended Windows agent:
@@ -256,18 +321,18 @@ Two extra build options help deploy an unattended Windows agent:
 
 ### Windows notes
 
-The proxy needs Administrator rights and `wintun.dll` (from https://www.wintun.net) next to
-`zunnel-proxy.exe`. Interfaces get addresses `198.18.0.1/32`, `198.18.0.2/32`, and so on, skipping
-any already in use, so several proxies can run on one machine. Each interface gets a firewall rule
+The server needs Administrator rights and `wintun.dll` (from https://www.wintun.net) next to
+`zunnel-server.exe`. Interfaces get addresses `198.18.0.1/32`, `198.18.0.2/32`, and so on, skipping
+any already in use, so several servers can run on one machine. Each interface gets a firewall rule
 allowing inbound ICMP destination-unreachable to its own address only (new adapters are on the
-Public profile, which drops it), and the rule is removed with the interface. The proxy's listening
+Public profile, which drops it), and the rule is removed with the interface. The server's listening
 port is opened with `SO_EXCLUSIVEADDRUSE`, so no other local program can take it over.
 
 Windows refuses to send to `240.0.0.0/4`, so on Windows pick another network to reach the agent's
 localhost:
 
 ```
-zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -route 10.10.0.0/16
+zunnel-server -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -route 10.10.0.0/16
 ```
 
 ## Reliability
@@ -285,7 +350,7 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
   once per pass, not once per frame.
 - **Backpressure:** a receiver slower than the tunnel slows the sender down through the per-flow
   credit window instead of getting its connection reset. A socket error ends only the connection
-  it happened on, never the agent or proxy.
+  it happened on, never the agent or server.
 - **Bounded handshakes:** at most 64 handshakes are in progress (8 per source address), each with a
   10 s timeout.
 - **Monotonic timers:** heartbeats and every connection timeout run on a monotonic clock, so
@@ -293,14 +358,17 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
   Only log timestamps and `-expire` use the wall clock.
 - **TLS 1.3 by default:** every new link looks like HTTPS on the wire. The TLS and Noise
   handshakes together must complete within the 10 s handshake timeout. Noise still authenticates
-  the proxy inside TLS, so the self-signed cert is enough; `-tls-verify` and `-ca` enable a real
+  the server inside TLS, so the self-signed cert is enough; `-tls-verify` and `-ca` enable a real
   cert check for operators who want TLS to look like a normal HTTPS client.
 
 ## Scanning through the tunnel
 
 Tools should see what they would see on a VPN inside the target network. The agent has no
-privileges, so every TCP probe becomes a real `connect()` from the agent host, and the proxy
-translates the result back into packets:
+privileges, so every TCP probe becomes a real `connect()` from the agent host, and the server
+translates the result back into packets.
+
+> **Not yet tested:** I haven't had a chance to run nmap scans through zunnel myself yet. The
+> table below describes the intended behaviour, not verified results.
 
 | What happened on the agent | What your tool sees | nmap reports |
 |---|---|---|
@@ -316,7 +384,7 @@ translates the result back into packets:
   target sees a full TCP connection from the agent for each open port.
 - Failed dials are cached for 10 s, so retransmitted SYNs get the same answer without another dial.
 - Large UDP datagrams (DNS over UDP with EDNS, QUIC, nmap's `-sU --data-length`) are supported in
-  both directions: the proxy reassembles IPv4 fragments arriving from the TUN and fragments
+  both directions: the server reassembles IPv4 fragments arriving from the TUN and fragments
   oversized replies before writing them back. Up to the IPv4 UDP maximum of 65,507 bytes;
   fragments that would reassemble past the IPv4 maximum are dropped, and each fragmented reply
   gets its own IP ID so concurrent large replies can't be mixed up.
@@ -342,7 +410,7 @@ translates the result back into packets:
   that redraws around the input line
 - [x] Review fixes: agent shutdown race, connection timeouts measured per state, connections the
   client abandons early cleaned up at once, monotonic timers
-- [x] P2 transports (part 1): TLS 1.3 transport (mbedTLS on the proxy, `std.crypto.tls.Client`
+- [x] P2 transports (part 1): TLS 1.3 transport (mbedTLS on the server, `std.crypto.tls.Client`
   on the agent, self-signed cert on first run, `-tls-verify` for a real cert check), and the
   ZNL6 wire with no cleartext magic and record padding
 - [x] P2 Windows deployment: `-Dagent-windowed` builds a GUI-subsystem agent (no console window),
@@ -354,7 +422,7 @@ translates the result back into packets:
   no longer spins on their sockets), reads on drained Windows sockets no longer reset the flow,
   aborted dials return their slot, slow receivers get backpressure instead of a reset, send
   and connect errors that Zig's std wrappers treat as impossible no longer crash the process,
-  oversize fragment sets no longer crash the proxy, and fragmented replies get unique IP IDs
+  oversize fragment sets no longer crash the server, and fragmented replies get unique IP IDs
 
 ## Roadmap
 
@@ -364,7 +432,7 @@ translates the result back into packets:
   build time (`-Dagent-connect=… -Dagent-pubkey=… -Dagent-secret=…`). Also the prerequisite for a
   possible agent DLL build (see Potential future plans).
 - [x] Shared secret by default (generated into the key file); `-no-secret` warns loudly.
-- [x] Proxy config file: `save` writes interfaces, routes, bindings and listeners; `-config` restores them.
+- [x] Server config file: `save` writes interfaces, routes, bindings and listeners; `-config` restores them.
 - [x] `kill <agent>`, and an optional agent `-expire <time>` for engagement windows.
 - [x] Agent `ifconfig` (interfaces, addresses, gateway, suggested routes) and `session info`.
 - [x] `flows [iface]` command, plus per-flow, per-interface and per-link byte counters.
@@ -384,7 +452,17 @@ translates the result back into packets:
 - [x] Event-driven relay: one `poll`/`WSAPoll` thread per link, no per-flow threads. (A future
   pass may swap `poll` for epoll on Linux and IOCP on Windows if the lab shows the readiness scan
   is a bottleneck.)
-- [ ] IPv6 (lwIP dual stack, IPv6 routes on the TUN).
-- [ ] kqueue reactor for macOS; a macOS proxy (`utun`).
+- [ ] IPv6 (lwIP dual stack, IPv6 routes on the TUN, IPv6 fragment reassembly).
+- [ ] Zero-copy packet pipeline; epoll (Linux) and IOCP (Windows) reactor backends.
+- [ ] kqueue reactor for macOS; a macOS server (`utun`).
 - [ ] In-repo integration lab (`lab.sh` with network namespaces) and CI cross-compiling Linux,
   Windows and macOS.
+
+### P4: multi-agent operations
+- [ ] **Multi-agent console.** Manage several active sessions from one console and move routes
+  between them on the fly.
+- [ ] **Native chaining.** Built-in agent-to-agent relay routing, so a tunnel can reach deeply
+  nested subnets through intermediate agents without setting up listeners by hand.
+- [ ] **`autoroute`.** One console command: the server builds the routes to every network the
+  connected agents can reach (the subnets agent `ifconfig` already suggests), choosing which
+  agent serves each, instead of adding routes one by one.
