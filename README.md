@@ -281,7 +281,8 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
   concurrent flows cost dozens of bytes of state instead of 256 KiB stacks. A 1,000-flow scan
   used to allocate ~750 MB of stack across threads; it now sits at a handful of threads total.
   The thread sleeps while nothing happens, and a connection's socket is closed as soon as both
-  directions have finished or either side resets.
+  directions have finished or either side resets. Frames arriving from the link wake it at most
+  once per pass, not once per frame.
 - **Backpressure:** a receiver slower than the tunnel slows the sender down through the per-flow
   credit window instead of getting its connection reset. A socket error ends only the connection
   it happened on, never the agent or proxy.

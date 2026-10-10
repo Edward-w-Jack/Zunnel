@@ -14,6 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const clock = @import("clock.zig");
 const sock = @import("sock.zig");
 
 const Allocator = std.mem.Allocator;
@@ -52,9 +53,14 @@ pub const Reactor = struct {
     scratch: std.ArrayList(posix.pollfd) = .empty,
     /// `entries` index of each `scratch` slot after the wake socket's.
     polled: std.ArrayList(u32) = .empty,
+    /// `entries` index of each registered handle.
+    index: std.AutoHashMapUnmanaged(sock.Handle, u32) = .empty,
     /// UDP loopback socket signalled by `wake`; always first in `scratch`.
     wake_sock: sock.Handle,
     wake_addr: std.net.Address,
+    /// A wake datagram is queued and not yet drained: further `wake`s skip
+    /// the syscall.
+    wake_pending: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: Allocator) !Reactor {
         const h = try sock.udpBind(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0));
@@ -69,24 +75,33 @@ pub const Reactor = struct {
         self.entries.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.polled.deinit(self.gpa);
+        self.index.deinit(self.gpa);
     }
 
     /// Registers `h` for `interest`. `ctx` is handed back on every readiness
     /// event for this handle; it must stay valid until `remove`. The handle
     /// should already be non-blocking (`sock.setNonblocking`).
     pub fn add(self: *Reactor, h: sock.Handle, ctx: *anyopaque, interest: Interest) !void {
-        if (self.findIndex(h) != null) return error.AlreadyRegistered;
+        const gop = try self.index.getOrPut(self.gpa, h);
+        if (gop.found_existing) return error.AlreadyRegistered;
+        errdefer _ = self.index.remove(h);
+        gop.value_ptr.* = @intCast(self.entries.items.len);
         try self.entries.append(self.gpa, .{ .handle = h, .ctx = ctx, .interest = interest });
     }
 
     pub fn modify(self: *Reactor, h: sock.Handle, interest: Interest) !void {
-        const idx = self.findIndex(h) orelse return error.NotRegistered;
+        const idx = self.index.get(h) orelse return error.NotRegistered;
         self.entries.items[idx].interest = interest;
     }
 
     /// Removes `h` from the reactor. Safe to call on an unregistered handle.
     pub fn remove(self: *Reactor, h: sock.Handle) void {
-        if (self.findIndex(h)) |idx| _ = self.entries.swapRemove(idx);
+        const kv = self.index.fetchRemove(h) orelse return;
+        _ = self.entries.swapRemove(kv.value);
+        // The last entry moved into the freed slot.
+        if (kv.value < self.entries.items.len) {
+            self.index.getPtr(self.entries.items[kv.value].handle).?.* = kv.value;
+        }
     }
 
     /// Waits up to `timeout_ms` (-1 to block indefinitely, 0 to poll). Fills
@@ -115,7 +130,13 @@ pub const Reactor = struct {
 
         const n = try posix.poll(self.scratch.items, timeout_ms);
         if (n == 0) return 0;
-        if (self.scratch.items[0].revents & posix.POLL.IN != 0) self.drainWake();
+        if (self.scratch.items[0].revents & posix.POLL.IN != 0) {
+            self.drainWake();
+            // Cleared after the drain: a `wake` in between was skipped, but
+            // the caller looks at shared state only after `wait` returns, so
+            // it still sees that change.
+            self.wake_pending.store(false, .release);
+        }
 
         var out_i: usize = 0;
         for (self.scratch.items[1..], self.polled.items) |pfd, idx| {
@@ -136,19 +157,18 @@ pub const Reactor = struct {
     }
 
     /// Thread-safe: nudges `wait` to return promptly on the reactor's thread.
-    /// Multiple concurrent `wake`s coalesce into one drain.
+    /// Until `wait` drains it, further `wake`s cost one atomic swap: no
+    /// syscall per call.
     pub fn wake(self: *Reactor) void {
-        sock.sendTo(self.wake_sock, &[_]u8{1}, self.wake_addr) catch {};
+        if (self.wake_pending.swap(true, .acq_rel)) return;
+        sock.sendTo(self.wake_sock, &[_]u8{1}, self.wake_addr) catch {
+            self.wake_pending.store(false, .release);
+        };
     }
 
     fn drainWake(self: *Reactor) void {
         var buf: [256]u8 = undefined;
         while (true) _ = sock.recvFrom(self.wake_sock, &buf) catch break;
-    }
-
-    fn findIndex(self: *Reactor, h: sock.Handle) ?usize {
-        for (self.entries.items, 0..) |e, i| if (e.handle == h) return i;
-        return null;
     }
 
     pub fn count(self: *const Reactor) usize {
@@ -176,6 +196,65 @@ test "wake returns from wait within 100 ms" {
     var events: [4]Event = undefined;
     const n = try r.wait(&events, 500);
     try testing.expectEqual(@as(usize, 0), n); // wake drains silently
+}
+
+test "a burst of wakes queues a single datagram" {
+    var r = try Reactor.init(testing.allocator);
+    defer r.deinit();
+
+    const T = struct {
+        fn fire(reactor: *Reactor) void {
+            for (0..1000) |_| reactor.wake();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, T.fire, .{&r});
+    t.join();
+
+    try testing.expect(sock.pollRead(r.wake_sock, 1000));
+    std.Thread.sleep(20 * std.time.ns_per_ms); // let any stragglers land
+    var buf: [16]u8 = undefined;
+    var queued: usize = 0;
+    while (true) : (queued += 1) _ = sock.recvFrom(r.wake_sock, &buf) catch break;
+    try testing.expectEqual(@as(usize, 1), queued);
+}
+
+test "every wake after a drain still wakes wait" {
+    var r = try Reactor.init(testing.allocator);
+    defer r.deinit();
+    var events: [4]Event = undefined;
+    for (0..3) |_| {
+        r.wake();
+        const start = clock.monotonicMs();
+        try testing.expectEqual(@as(usize, 0), try r.wait(&events, 1000));
+        try testing.expect(clock.monotonicMs() - start < 500);
+    }
+}
+
+test "remove keeps the other registrations intact" {
+    const gpa = testing.allocator;
+    var r = try Reactor.init(gpa);
+    defer r.deinit();
+
+    var socks: [3]sock.Handle = undefined;
+    var ctxs: [3]usize = .{ 0, 1, 2 };
+    for (&socks, &ctxs) |*h, *ctx| {
+        h.* = try sock.udpBind(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0));
+        try sock.setNonblocking(h.*);
+        try r.add(h.*, @ptrCast(ctx), .{ .read = true });
+    }
+    defer for (socks) |h| sock.close(h);
+
+    // Removing the first entry moves the last into its slot; the index must
+    // follow, or the next modify/remove hits the wrong socket.
+    r.remove(socks[0]);
+    try r.modify(socks[1], .{});
+    try sock.sendTo(socks[2], "x", sock.localAddress(socks[2]).?);
+    var events: [4]Event = undefined;
+    try testing.expectEqual(@as(usize, 1), try r.wait(&events, 1000));
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(&ctxs[2])), events[0].ctx);
+    r.remove(socks[2]);
+    r.remove(socks[1]);
+    try testing.expectEqual(@as(usize, 0), r.count());
 }
 
 test "a connected TCP pair signals readable on data arrival" {

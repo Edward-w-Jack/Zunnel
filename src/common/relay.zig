@@ -291,6 +291,8 @@ pub const Flow = struct {
     /// Counted in `Table.dialing` until the dial connects or the flow ends.
     holds_dial_slot: bool = false,
     registered: bool = false,
+    /// What the reactor currently has for this flow's socket.
+    reg_interest: reactor_mod.Interest = .{},
 
     created: i64 = 0,
     last_active: i64 = 0,
@@ -484,8 +486,10 @@ fn syncRegistrations(table: *Table, timeout_ms: *i32) void {
         if (!flow.registered) {
             table.reactor.add(h, @ptrCast(flow), interest) catch continue;
             flow.registered = true;
-        } else {
+            flow.reg_interest = interest;
+        } else if (!interest.eql(flow.reg_interest)) {
             table.reactor.modify(h, interest) catch {};
+            flow.reg_interest = interest;
         }
         if (flow.nextDeadline(now)) |d| if (d < timeout_ms.*) {
             timeout_ms.* = @max(0, d);
