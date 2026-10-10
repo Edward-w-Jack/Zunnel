@@ -277,6 +277,9 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
 - **Bounded dials:** the agent connects with a timeout (`-dial-timeout`), at most `-max-dials`
   connects run per interface, and further SYNs queue instead of spawning more work. A 2,000-port
   burst finishes in about 16 s with one agent connect per port.
+- **Event-driven I/O:** the relay (both sides) runs on one `poll`/`WSAPoll` thread per link, so
+  concurrent flows cost dozens of bytes of state instead of 256 KiB stacks. A 1,000-flow scan
+  used to allocate ~750 MB of stack across threads; it now sits at a handful of threads total.
 - **Bounded handshakes:** at most 64 handshakes are in progress (8 per source address), each with a
   10 s timeout.
 - **Monotonic timers:** heartbeats and every connection timeout run on a monotonic clock, so
@@ -306,6 +309,9 @@ translates the result back into packets:
 - `-sT`, `-sS`, `-sU`, `-sV`, NSE and default host discovery work. `-sS` behaves like `-sT`: the
   target sees a full TCP connection from the agent for each open port.
 - Failed dials are cached for 10 s, so retransmitted SYNs get the same answer without another dial.
+- Large UDP datagrams (DNS over UDP with EDNS, QUIC, nmap's `-sU --data-length`) are supported in
+  both directions: the proxy reassembles IPv4 fragments arriving from the TUN and fragments
+  oversized replies before writing them back. Up to the IPv4 UDP maximum of 65,507 bytes.
 - Not possible through any unprivileged pivot: `-sA/-sF/-sN/-sX/-sW`, `-O`, `--traceroute`.
 
 ## Done
@@ -333,6 +339,9 @@ translates the result back into packets:
   ZNL6 wire with no cleartext magic and record padding
 - [x] P2 Windows deployment: `-Dagent-windowed` builds a GUI-subsystem agent (no console window),
   `-Dagent-service` adds `install-service`/`uninstall-service` subcommands and SCM dispatch
+- [x] P3 scale (part 1): IPv4 fragment reassembly and outbound fragmentation on the TUN,
+  single-record UDP datagrams up to 65 KiB, and a reactor-driven relay that replaces the per-flow
+  thread model with one `poll`/`WSAPoll` thread per link
 
 ## Roadmap
 
@@ -358,9 +367,11 @@ translates the result back into packets:
 - [ ] WebSocket transport and HTTP CONNECT proxy traversal (with auto-detection on Windows).
 
 ### P3: protocol coverage and scale
+- [x] IPv4 fragment reassembly and outbound fragmentation on the TUN; UDP datagrams up to 65 KiB.
+- [x] Event-driven relay: one `poll`/`WSAPoll` thread per link, no per-flow threads. (A future
+  pass may swap `poll` for epoll on Linux and IOCP on Windows if the lab shows the readiness scan
+  is a bottleneck.)
 - [ ] IPv6 (lwIP dual stack, IPv6 routes on the TUN).
-- [ ] IP fragment reassembly and UDP datagrams over 16 KiB, which are currently dropped.
-- [ ] Event-driven agent (epoll/kqueue/IOCP) instead of thread-per-flow, for very large scans.
-- [ ] macOS proxy (utun).
+- [ ] kqueue reactor for macOS; a macOS proxy (`utun`).
 - [ ] In-repo integration lab (`lab.sh` with network namespaces) and CI cross-compiling Linux,
   Windows and macOS.
