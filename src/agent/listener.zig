@@ -4,6 +4,7 @@
 const std = @import("std");
 const common = @import("common");
 
+const clock = common.clock;
 const proto = common.proto;
 const sock = common.sock;
 const relay = common.relay;
@@ -77,11 +78,11 @@ pub const Listener = struct {
             assocs.deinit(self.gpa);
         }
         var buf: [proto.max_payload]u8 = undefined;
-        var last_sweep = std.time.milliTimestamp();
+        var last_sweep = clock.monotonicMs();
 
         while (!self.stopping.load(.acquire)) {
-            if (std.time.milliTimestamp() - last_sweep >= 1000) {
-                last_sweep = std.time.milliTimestamp();
+            if (clock.monotonicMs() - last_sweep >= 1000) {
+                last_sweep = clock.monotonicMs();
                 var i: usize = 0;
                 while (i < assocs.items.len) {
                     const f = assocs.items[i].flow;

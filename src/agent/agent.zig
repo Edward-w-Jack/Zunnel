@@ -105,13 +105,16 @@ fn currentPid() u64 {
 
 /// Plain `key=value` lines describing this host, shown in the proxy console.
 fn buildHello(gpa: Allocator, cfg: Config) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     const hostname: []const u8 = if (builtin.os.tag == .windows)
-        envOr(gpa, &.{"COMPUTERNAME"}, "unknown")
+        envOr(arena, &.{"COMPUTERNAME"}, "unknown")
     else blk: {
         var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        break :blk gpa.dupe(u8, std.posix.gethostname(&host_buf) catch "unknown") catch "unknown";
+        break :blk arena.dupe(u8, std.posix.gethostname(&host_buf) catch "unknown") catch "unknown";
     };
-    const user = envOr(gpa, &.{ "USER", "USERNAME", "LOGNAME" }, "unknown");
+    const user = envOr(arena, &.{ "USER", "USERNAME", "LOGNAME" }, "unknown");
     var mid_buf: [256]u8 = undefined;
     const derived = identity.derive(identity.machineId(&mid_buf), user);
     const id = cfg.id orelse &derived;
@@ -126,7 +129,7 @@ fn buildHello(gpa: Allocator, cfg: Config) ![]u8 {
     return out.toOwnedSlice();
 }
 
-const SessionEnd = enum { disconnected, killed, expired, stopped };
+const SessionEnd = enum(u8) { disconnected, killed, expired, stopped };
 
 fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop: *std.atomic.Value(bool)) !SessionEnd {
     log.info("connecting to {s}:{d}", .{ cfg.host, cfg.port });
@@ -143,10 +146,11 @@ fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop:
     const watchdog = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Session.watch, .{ &session, cfg, stop }) catch null;
     session.run();
     session.done.store(true, .release);
+    // The watchdog may close the link until it has exited: free it only then.
     if (watchdog) |t| t.join();
-    const end = session.end;
+    session.link.destroy();
     log.info("connection to proxy closed", .{});
-    return end;
+    return session.end.load(.acquire);
 }
 
 const Session = struct {
@@ -156,11 +160,20 @@ const Session = struct {
     /// Only touched by the dispatch thread.
     listeners: std.AutoHashMapUnmanaged(u32, *Listener) = .empty,
     icmp_inflight: std.atomic.Value(u32) = .init(0),
-    end: SessionEnd = .disconnected,
+    /// Why the session ended; set by `finish`.
+    end: std.atomic.Value(SessionEnd) = .init(.disconnected),
     done: std.atomic.Value(bool) = .init(false),
 
     const max_icmp_inflight = 32;
 
+    /// Records why the session ends. The dispatch thread (kill) and the
+    /// watchdog (stop, expiry) can race: the first reason wins.
+    fn finish(self: *Session, why: SessionEnd) void {
+        _ = self.end.cmpxchgStrong(.disconnected, why, .acq_rel, .acquire);
+    }
+
+    /// Serves frames until the link ends, then stops listeners and flows.
+    /// The caller destroys the link once the watchdog has exited.
     fn run(self: *Session) void {
         while (true) {
             const frame = self.link.recvFrame() catch break;
@@ -176,20 +189,19 @@ const Session = struct {
         self.listeners.deinit(self.gpa);
         // Waits until no flow or helper thread references the link.
         self.table.shutdown();
-        self.link.destroy();
     }
 
     /// Ends the session when the embedder stops the agent or it expires.
     fn watch(self: *Session, cfg: Config, stop: *std.atomic.Value(bool)) void {
         while (!self.done.load(.acquire)) {
             if (stop.load(.acquire)) {
-                self.end = .stopped;
+                self.finish(.stopped);
                 self.link.close();
                 return;
             }
             if (expired(cfg)) {
                 log.info("agent expired, shutting down", .{});
-                self.end = .expired;
+                self.finish(.expired);
                 self.link.close();
                 return;
             }
@@ -211,7 +223,7 @@ const Session = struct {
             .info_request => self.sendInfo(frame.id),
             .kill => {
                 log.info("killed by the proxy", .{});
-                self.end = .killed;
+                self.finish(.killed);
                 return error.Killed;
             },
             else => _ = self.table.dispatch(frame),
@@ -279,4 +291,69 @@ fn targetAddress(req: proto.ConnectRequest) std.net.Address {
     if (req.addr.len == 4 and req.addr[0] & 0xf0 == proto.magic_localhost_net[0])
         return std.net.Address.initIp4(.{ 127, 0, 0, 1 }, req.port);
     return proto.endpointAddress(req);
+}
+
+/// A minimal proxy for tests: accepts one agent, optionally kills it, then
+/// serves until the agent hangs up.
+const FakeProxy = struct {
+    listener: *std.net.Server,
+    key: common.noise.KeyPair,
+    send_kill: bool,
+    up: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+
+    fn serve(self: *FakeProxy) void {
+        self.serveInner() catch |err| {
+            self.err = err;
+        };
+        self.up.store(true, .release); // also on failure, so stopWhenUp ends
+    }
+
+    fn serveInner(self: *FakeProxy) !void {
+        const conn = try self.listener.accept();
+        var hello_buf: [common.link.max_hello_len]u8 = undefined;
+        const psk = common.noise.pskFromSecret("s3cret");
+        const hs = common.link.serverHandshake(std.testing.allocator, conn.stream.handle, self.key, psk, &hello_buf) catch |err| {
+            conn.stream.close();
+            return err;
+        };
+        defer hs.link.destroy();
+        if (std.mem.indexOf(u8, hs.hello, "id=test-agent\n") == null) return error.UnexpectedHello;
+        self.up.store(true, .release);
+        if (self.send_kill) try hs.link.send(.kill, 0, &.{});
+        while (true) _ = hs.link.recvFrame() catch break;
+    }
+
+    fn stopWhenUp(self: *FakeProxy, stop: *std.atomic.Value(bool)) void {
+        while (!self.up.load(.acquire)) std.Thread.sleep(5 * std.time.ns_per_ms);
+        stop.store(true, .release);
+    }
+};
+
+test "run ends cleanly when the proxy kills the agent or the embedder stops it" {
+    // std.testing.allocator fails the test if the link is leaked or freed twice.
+    const key = common.noise.KeyPair.generate();
+    var listener = try common.sock.listenTcp(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0), 4);
+    defer listener.deinit();
+    const cfg: Config = .{
+        .host = "127.0.0.1",
+        .port = listener.listen_address.getPort(),
+        .pubkey = key.public_key,
+        .insecure = false,
+        .secret = "s3cret",
+        .retry = false,
+        .expire_at_ms = null,
+        .id = "test-agent",
+    };
+    for ([_]RunResult{ .killed, .stopped }) |want| {
+        var proxy: FakeProxy = .{ .listener = &listener, .key = key, .send_kill = want == .killed };
+        const proxy_thread = try std.Thread.spawn(.{}, FakeProxy.serve, .{&proxy});
+        var stop = std.atomic.Value(bool).init(false);
+        const stopper = if (want == .stopped) try std.Thread.spawn(.{}, FakeProxy.stopWhenUp, .{ &proxy, &stop }) else null;
+        const got = run(std.testing.allocator, cfg, &stop);
+        if (stopper) |t| t.join();
+        proxy_thread.join();
+        if (proxy.err) |err| return err;
+        try std.testing.expectEqual(want, got);
+    }
 }

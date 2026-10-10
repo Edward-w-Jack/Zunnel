@@ -258,6 +258,9 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
   burst finishes in about 16 s with one agent connect per port.
 - **Bounded handshakes:** at most 64 handshakes are in progress (8 per source address), each with a
   10 s timeout.
+- **Monotonic timers:** heartbeats and every connection timeout run on a monotonic clock, so
+  changing the system time (an NTP correction, a VM resuming) doesn't drop links or stall timers.
+  Only log timestamps and `-expire` use the wall clock.
 
 ## Scanning through the tunnel
 
@@ -298,6 +301,8 @@ translates the result back into packets:
   byte counters, timestamped logging and `-log`
 - [x] P1 operations (part 3): console line editing, history, tab completion, and async output
   that redraws around the input line
+- [x] Review fixes: agent shutdown race, connection timeouts measured per state, connections the
+  client abandons early cleaned up at once, monotonic timers
 
 ## Roadmap
 

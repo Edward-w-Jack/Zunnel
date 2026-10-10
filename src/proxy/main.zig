@@ -585,8 +585,7 @@ const Console = struct {
         server.mutex.lock();
         defer server.mutex.unlock();
         const s = self.resolveAgentLocked(agent_arg) orelse return;
-        const now = std.time.milliTimestamp();
-        const up: u64 = @intCast(@max(0, @divTrunc(now - s.joined_ms, 1000)));
+        const up: u64 = @intCast(@max(0, @divTrunc(common.clock.monotonicMs() - s.joined_ms, 1000)));
         std.debug.print("agent #{d}\n  ident     {s}\n  user      {s}\n  host      {s}\n  os/arch   {s}/{s}\n  pid       {s}\n  version   {s}\n", .{
             s.id, s.ident, s.user, s.hostname, s.os, s.arch, s.pid, s.version,
         });
@@ -595,7 +594,8 @@ const Console = struct {
         } else std.debug.print("  remote    {f}\n", .{s.remote});
         std.debug.print("  connected {d}h{d:0>2}m{d:0>2}s ago\n", .{ up / 3600, up % 3600 / 60, up % 60 });
         if (s.expire_ms) |deadline| {
-            const left: u64 = @intCast(@max(0, @divTrunc(deadline - now, 1000)));
+            // -expire is a wall-clock deadline (Unix ms).
+            const left: u64 = @intCast(@max(0, @divTrunc(deadline - std.time.milliTimestamp(), 1000)));
             std.debug.print("  expires   in {d}h{d:0>2}m{d:0>2}s\n", .{ left / 3600, left % 3600 / 60, left % 60 });
         }
         std.debug.print("  link      {d} bytes sent, {d} received\n", .{ s.link.bytes_tx.load(.monotonic), s.link.bytes_rx.load(.monotonic) });
@@ -945,4 +945,5 @@ test {
     _ = @import("packet.zig");
     _ = @import("tun.zig");
     _ = @import("lineedit.zig");
+    _ = @import("tunnel.zig");
 }

@@ -2,6 +2,7 @@
 //! (std.net.Stream.read uses ReadFile on Windows, which is unreliable for sockets.)
 const std = @import("std");
 const builtin = @import("builtin");
+const clock = @import("clock.zig");
 const posix = std.posix;
 const ws2 = std.os.windows.ws2_32;
 
@@ -203,11 +204,11 @@ test "tcpConnect: refused fast, unroutable times out" {
     // Nothing listens on port 1 of loopback.
     try std.testing.expectError(error.ConnectionRefused, tcpConnect(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 1), 5000));
     // A blackholed address must give up close to the timeout, not after the OS default.
-    const start = std.time.milliTimestamp();
+    const start = clock.monotonicMs();
     if (tcpConnect(std.net.Address.initIp4(.{ 10, 255, 255, 1 }, 9), 300)) |h| {
         close(h);
     } else |_| {}
-    try std.testing.expect(std.time.milliTimestamp() - start < 2000);
+    try std.testing.expect(clock.monotonicMs() - start < 2000);
 }
 
 pub fn setKeepAlive(h: Handle) void {

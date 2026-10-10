@@ -145,6 +145,7 @@ pub fn main() !void {
 }
 
 test {
+    _ = agent;
     _ = config;
     _ = @import("identity.zig");
     _ = @import("netinfo.zig");

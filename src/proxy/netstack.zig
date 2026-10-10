@@ -5,6 +5,7 @@ const lwip = @import("lwip.zig");
 const Tunnel = @import("tunnel.zig").Tunnel;
 
 const c = lwip.c;
+const clock = @import("common").clock;
 
 /// Serialises every lwIP call and all tunnel flow state.
 /// Lock order: Server.mutex -> netstack.lock -> Link.mutex.
@@ -40,13 +41,13 @@ pub fn unregister(t: *Tunnel) void {
 }
 
 fn timerLoop() void {
-    var last_sweep = std.time.milliTimestamp();
+    var last_sweep = clock.monotonicMs();
     while (true) {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         lock.lock();
         defer lock.unlock();
         c.sys_check_timeouts();
-        const now = std.time.milliTimestamp();
+        const now = clock.monotonicMs();
         if (now - last_sweep >= 1000) {
             last_sweep = now;
             for (tunnels.items) |t| t.sweepLocked(now);
@@ -56,8 +57,10 @@ fn timerLoop() void {
 
 // ------------------------------------------------------------------ C hooks
 
+/// lwIP's clock for TCP timers; monotonic so retransmit and TIME_WAIT timers
+/// are not thrown off when the system time is set. Wraps at 2^32 like lwIP expects.
 export fn sys_now() u32 {
-    return @truncate(@as(u64, @bitCast(std.time.milliTimestamp())));
+    return @truncate(@as(u64, @bitCast(clock.monotonicMs())));
 }
 
 export fn zunnel_lwip_rand() c_uint {

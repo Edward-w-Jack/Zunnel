@@ -30,7 +30,7 @@ pub const Session = struct {
     pid: []const u8 = "?",
     /// Agent's self-destruct deadline (Unix ms), if it has one.
     expire_ms: ?i64 = null,
-    /// When this session was established (Unix ms).
+    /// When this session was established (common.clock.monotonicMs).
     joined_ms: i64 = 0,
     /// Upstream agent this session was relayed through (see `relay` command).
     via: ?u32 = null,
@@ -200,7 +200,7 @@ pub const Server = struct {
             .remote = conn.address,
             .hello = self.gpa.dupe(u8, hs.hello) catch &.{},
             .relay = .init(self.gpa, hs.link),
-            .joined_ms = std.time.milliTimestamp(),
+            .joined_ms = common.clock.monotonicMs(),
         };
         s.relay.on_dialed = .{ .ctx = s, .func = onRelayDialed };
         s.parseHello();

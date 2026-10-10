@@ -9,6 +9,7 @@
 //! more whole frames (see proto.zig). Sending never blocks the caller: frames
 //! are queued and a dedicated writer thread encrypts and writes them.
 const std = @import("std");
+const clock = @import("clock.zig");
 const noise = @import("noise.zig");
 const proto = @import("proto.zig");
 const sock = @import("sock.zig");
@@ -40,7 +41,8 @@ pub const Link = struct {
     queue: std.ArrayList(u8) = .empty,
     closed: bool = false,
     writer: ?std.Thread = null,
-    /// When the last record arrived (ms); the writer closes the link when it goes stale.
+    /// When the last record arrived (clock.monotonicMs); the writer closes the
+    /// link when it goes stale.
     last_rx: std.atomic.Value(i64) = .init(0),
     /// Bytes on the wire (records, including encryption overhead).
     bytes_tx: std.atomic.Value(u64) = .init(0),
@@ -53,7 +55,7 @@ pub const Link = struct {
     fn create(gpa: Allocator, handle: sock.Handle, t: noise.Transport) !*Link {
         const self = try gpa.create(Link);
         self.* = .{ .gpa = gpa, .handle = handle, .tx = t.send, .rx = t.recv };
-        self.last_rx.store(std.time.milliTimestamp(), .monotonic);
+        self.last_rx.store(clock.monotonicMs(), .monotonic);
         errdefer gpa.destroy(self);
         // A peer that stops reading for this long is as dead as a silent one.
         sock.setSendTimeout(handle, proto.link_dead_after_ms);
@@ -133,7 +135,7 @@ pub const Link = struct {
         };
         defer self.gpa.free(out);
 
-        var last_ping = std.time.milliTimestamp();
+        var last_ping = clock.monotonicMs();
         while (true) {
             {
                 self.mutex.lock();
@@ -141,7 +143,7 @@ pub const Link = struct {
                 while (true) {
                     if (self.closed) return;
                     // Heartbeat: both ends ping; whatever arrives refreshes last_rx.
-                    const now = std.time.milliTimestamp();
+                    const now = clock.monotonicMs();
                     if (now - self.last_rx.load(.monotonic) > proto.link_dead_after_ms) {
                         log.warn("link timed out: nothing received for {d}s", .{@divTrunc(proto.link_dead_after_ms, 1000)});
                         self.closeLocked();
@@ -207,7 +209,7 @@ pub const Link = struct {
         try self.rx.decrypt(self.rx_buf[0..plain_len], "", self.rx_buf[0..len]);
         self.rx_pos = 0;
         self.rx_len = plain_len;
-        self.last_rx.store(std.time.milliTimestamp(), .monotonic);
+        self.last_rx.store(clock.monotonicMs(), .monotonic);
         _ = self.bytes_rx.fetchAdd(2 + len, .monotonic);
     }
 };

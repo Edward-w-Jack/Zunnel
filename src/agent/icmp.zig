@@ -4,6 +4,7 @@
 //!   binary when unprivileged ICMP sockets are not permitted.
 const std = @import("std");
 const builtin = @import("builtin");
+const clock = @import("common").clock;
 const posix = std.posix;
 
 pub const Result = struct { ok: bool, rtt_ms: u16 = 0 };
@@ -64,12 +65,12 @@ fn socketEcho(addr: [4]u8, timeout_ms: u32) !Result {
     var req = [_]u8{ 8, 0, 0, 0, 0, 0, 0, 1 } ++ "zunnel-ping-0123".*;
     std.mem.writeInt(u16, req[2..4], checksum(&req), .big);
     const dest = std.net.Address.initIp4(addr, 0);
-    const start = std.time.milliTimestamp();
+    const start = clock.monotonicMs();
     _ = try posix.sendto(fd, &req, 0, &dest.any, dest.getOsSockLen());
 
     var buf: [1500]u8 = undefined;
     while (true) {
-        const elapsed = std.time.milliTimestamp() - start;
+        const elapsed = clock.monotonicMs() - start;
         if (elapsed >= timeout_ms) return .{ .ok = false };
         var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
         if (try posix.poll(&fds, @intCast(@as(i64, timeout_ms) - elapsed)) == 0) return .{ .ok = false };
@@ -78,7 +79,7 @@ fn socketEcho(addr: [4]u8, timeout_ms: u32) !Result {
         var msg = buf[0..n];
         if (msg.len >= 20 and msg[0] >> 4 == 4) msg = msg[@as(usize, msg[0] & 0x0f) * 4 ..];
         if (msg.len >= 8 and msg[0] == 0) {
-            const rtt = std.time.milliTimestamp() - start;
+            const rtt = clock.monotonicMs() - start;
             return .{ .ok = true, .rtt_ms = @intCast(@min(rtt, std.math.maxInt(u16))) };
         }
     }
@@ -90,7 +91,7 @@ fn pingCommand(gpa: std.mem.Allocator, addr: [4]u8, timeout_ms: u32) Result {
     var secs_buf: [8]u8 = undefined;
     const secs = std.fmt.bufPrint(&secs_buf, "{d}", .{@max(1, (timeout_ms + 999) / 1000)}) catch return .{ .ok = false };
     const wait_flag = if (builtin.os.tag.isDarwin()) "-t" else "-W";
-    const start = std.time.milliTimestamp();
+    const start = clock.monotonicMs();
     const res = std.process.Child.run(.{ .allocator = gpa, .argv = &.{ "ping", "-c", "1", wait_flag, secs, ip } }) catch
         return .{ .ok = false };
     gpa.free(res.stdout);
@@ -99,6 +100,6 @@ fn pingCommand(gpa: std.mem.Allocator, addr: [4]u8, timeout_ms: u32) Result {
         .Exited => |code| code == 0,
         else => false,
     };
-    const rtt = std.time.milliTimestamp() - start;
+    const rtt = clock.monotonicMs() - start;
     return .{ .ok = ok, .rtt_ms = @intCast(@min(rtt, std.math.maxInt(u16))) };
 }

@@ -10,6 +10,7 @@
 //!   - UDP listener associations (`Table.adoptUdp`): datagrams are read by the
 //!              listener and replies go out with sendto on its socket.
 const std = @import("std");
+const clock = @import("clock.zig");
 const proto = @import("proto.zig");
 const sock = @import("sock.zig");
 const link_mod = @import("link.zig");
@@ -267,11 +268,11 @@ pub const Flow = struct {
     }
 
     pub fn touch(self: *Flow) void {
-        self.last_active.store(std.time.milliTimestamp(), .monotonic);
+        self.last_active.store(clock.monotonicMs(), .monotonic);
     }
 
     pub fn idleMs(self: *Flow) i64 {
-        return std.time.milliTimestamp() - self.last_active.load(.monotonic);
+        return clock.monotonicMs() - self.last_active.load(.monotonic);
     }
 
     pub fn isAborted(self: *Flow) bool {

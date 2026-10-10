@@ -22,12 +22,22 @@ const tun = @import("tun.zig");
 const Session = @import("server.zig").Session;
 
 const c = lwip.c;
+const clock = common.clock;
 const proto = common.proto;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.tunnel);
 
 const udp_idle_ms = 120 * std.time.ms_per_s;
+/// Once lwIP has answered the client's SYN (the agent connected), the client
+/// must complete the TCP handshake within this long.
 const handshake_timeout_ms = 30 * std.time.ms_per_s;
+/// A SYN waiting for a dial slot is dropped once the client has not
+/// retransmitted it for this long: it gave up (common TCP stacks retry for
+/// about two minutes at most, with gaps of up to a minute).
+const queued_give_up_ms = 2 * std.time.ms_per_min;
+/// Backstop for a dial the agent never answers, on top of the dial timeout
+/// (covers the agent's own dial queue and link latency).
+const dial_answer_grace_ms = 30 * std.time.ms_per_s;
 const icmp_timeout_ms = 2000;
 const max_pending_icmp = 256;
 /// Return flow-control credit to the agent in batches of at least this much.
@@ -86,7 +96,11 @@ const Flow = struct {
     tuple: Tuple,
     /// queued: waiting for a free dial slot; dialing: agent is connecting.
     state: enum { queued, dialing, open } = .dialing,
+    /// When the flow started (clock.monotonicMs), shown by `flows`.
     created: i64,
+    /// When the flow entered its current state. While queued it is also
+    /// refreshed by every retransmitted SYN: the client is still waiting.
+    since: i64,
 
     // --- TCP
     /// The client's SYN, replayed into lwIP once the agent connected.
@@ -321,7 +335,7 @@ pub const Tunnel = struct {
     pub fn printFlows(self: *Tunnel, limit: usize) void {
         netstack.lock.lock();
         defer netstack.lock.unlock();
-        const now = std.time.milliTimestamp();
+        const now = clock.monotonicMs();
         var shown: usize = 0;
         var it = self.flows.valueIterator();
         while (it.next()) |fp| {
@@ -420,21 +434,23 @@ pub const Tunnel = struct {
         }
     }
 
-    /// Called by the netstack timer (lock held): expires idle UDP flows, TCP
-    /// flows whose client never finished the handshake, and unanswered pings.
+    /// Called by the netstack timer (lock held, `now` from clock.monotonicMs):
+    /// drops flows that wait for something that is not coming (see `isStale`)
+    /// and unanswered pings.
     pub fn sweepLocked(self: *Tunnel, now: i64) void {
-        var stale: std.ArrayList(*Flow) = .empty;
+        const dial_timeout_ms: i64 = if (self.session) |s| s.server.dial_timeout_ms else proto.default_dial_timeout_ms;
+        // Collect ids, not pointers: dropping one flow can start or end others
+        // (a freed dial slot starts the next queued dial).
+        var stale: std.ArrayList(u32) = .empty;
         defer stale.deinit(self.gpa);
         var it = self.flows.valueIterator();
         while (it.next()) |fp| {
-            const f = fp.*;
-            const expired = if (f.tuple.proto == packet.proto_udp)
-                now - f.last_active > udp_idle_ms
-            else
-                f.pcb == null and now - f.created > handshake_timeout_ms;
-            if (expired) stale.append(self.gpa, f) catch break;
+            if (isStale(fp.*, now, dial_timeout_ms)) stale.append(self.gpa, fp.*.id) catch break;
         }
-        for (stale.items) |f| self.abortFlow(f, true);
+        for (stale.items) |id| {
+            const f = self.flows.get(id) orelse continue;
+            if (isStale(f, now, dial_timeout_ms)) self.dropFlow(f, "timed out");
+        }
 
         var expired_icmp: std.ArrayList(u32) = .empty;
         defer expired_icmp.deinit(self.gpa);
@@ -452,7 +468,7 @@ pub const Tunnel = struct {
     fn remember(self: *Tunnel, t: Tuple, verdict: Verdict) void {
         if (self.recent.count() >= max_recent) return;
         const ttl: i64 = if (verdict == .closing) closing_ttl_ms else verdict_ttl_ms;
-        self.recent.put(self.gpa, t, .{ .verdict = verdict, .expires = std.time.milliTimestamp() + ttl }) catch {};
+        self.recent.put(self.gpa, t, .{ .verdict = verdict, .expires = clock.monotonicMs() + ttl }) catch {};
     }
 
     // ------------------------------------------------------- packet input
@@ -465,8 +481,13 @@ pub const Tunnel = struct {
                 const is_syn = seg.flags & (packet.tcp_syn | packet.tcp_ack | packet.tcp_rst) == packet.tcp_syn;
                 const t: Tuple = .{ .proto = packet.proto_tcp, .src = ip.src, .sport = seg.sport, .dst = ip.dst, .dport = seg.dport };
                 if (self.by_tuple.get(t)) |flow| {
-                    if (is_syn and flow.state != .open) return; // SYN retransmit while queued/dialing
-                    return self.feed(pkt);
+                    if (is_syn and flow.state != .open) return self.synAgain(flow, seg.seq, pkt);
+                    // Decide before feeding: on this RST lwIP frees its half-open
+                    // pcb. The flow has no lwIP callbacks yet, so feeding cannot free it.
+                    const reset_before_accept = isResetBeforeAccept(flow, seg);
+                    self.feed(pkt);
+                    if (reset_before_accept) self.dropFlow(flow, "client reset before the handshake completed");
+                    return;
                 }
                 if (self.recent.get(t)) |r| {
                     if (r.verdict == .closing) {
@@ -508,7 +529,8 @@ pub const Tunnel = struct {
     fn newFlow(self: *Tunnel, t: Tuple) !*Flow {
         const flow = try self.gpa.create(Flow);
         errdefer self.gpa.destroy(flow);
-        flow.* = .{ .tunnel = self, .id = self.allocId(), .tuple = t, .created = std.time.milliTimestamp() };
+        const now = clock.monotonicMs();
+        flow.* = .{ .tunnel = self, .id = self.allocId(), .tuple = t, .created = now, .since = now };
         try self.flows.ensureUnusedCapacity(self.gpa, 1);
         try self.by_tuple.ensureUnusedCapacity(self.gpa, 1);
         self.flows.putAssumeCapacity(flow.id, flow);
@@ -550,9 +572,22 @@ pub const Tunnel = struct {
         self.startDial(flow);
     }
 
+    /// Another SYN for a flow still waiting for its dial: a retransmission, or
+    /// (with a new initial sequence number) a new attempt on the same ports.
+    /// Keep the latest one, since that is the SYN replayed into lwIP.
+    fn synAgain(self: *Tunnel, flow: *Flow, seq: u32, syn: []const u8) void {
+        if (flow.state == .queued) flow.since = clock.monotonicMs(); // the client is still waiting
+        if (seq == flow.syn_seq) return;
+        const copy = self.gpa.dupe(u8, syn) catch return;
+        if (flow.syn) |old| self.gpa.free(old);
+        flow.syn = copy;
+        flow.syn_seq = seq;
+    }
+
     /// Takes a dial slot and asks the agent to connect.
     fn startDial(self: *Tunnel, flow: *Flow) void {
         flow.state = .dialing;
+        flow.since = clock.monotonicMs();
         flow.holds_dial_slot = true;
         self.dialing += 1;
         self.sendConnect(flow, .tcp) catch self.abortFlow(flow, false);
@@ -610,7 +645,7 @@ pub const Tunnel = struct {
             self.sendConnect(f, .udp) catch return self.abortFlow(f, false);
             break :blk f;
         };
-        flow.last_active = std.time.milliTimestamp();
+        flow.last_active = clock.monotonicMs();
         session.link.sendDroppable(.data, flow.id, dgram.data) catch {};
         flow.bytes_up += dgram.data.len;
         self.stats.bytes_up += dgram.data.len;
@@ -623,7 +658,7 @@ pub const Tunnel = struct {
         if (self.icmp.count() >= max_pending_icmp) return;
         const id = self.allocId();
         const copy = self.gpa.dupe(u8, pkt) catch return;
-        self.icmp.put(self.gpa, id, .{ .request = copy, .deadline = std.time.milliTimestamp() + icmp_timeout_ms + 1000 }) catch {
+        self.icmp.put(self.gpa, id, .{ .request = copy, .deadline = clock.monotonicMs() + icmp_timeout_ms + 1000 }) catch {
             self.gpa.free(copy);
             return;
         };
@@ -658,6 +693,7 @@ pub const Tunnel = struct {
         switch (frame.type) {
             .connect_ok => if (flow.state == .dialing) {
                 flow.state = .open;
+                flow.since = clock.monotonicMs();
                 self.endDial(flow);
                 if (flow.syn) |syn| {
                     flow.syn = null;
@@ -716,7 +752,7 @@ pub const Tunnel = struct {
             .connect_ok => flow.state = .open,
             .connect_fail, .reset => self.destroyFlow(flow),
             .data => {
-                flow.last_active = std.time.milliTimestamp();
+                flow.last_active = clock.monotonicMs();
                 var buf: [tun.mtu + 64 + proto.max_payload]u8 = undefined;
                 const t = flow.tuple;
                 const pkt = packet.buildUdp4(&buf, t.dst, t.dport, t.src, t.sport, frame.payload) orelse return;
@@ -820,6 +856,21 @@ pub const Tunnel = struct {
         self.destroyFlow(flow);
     }
 
+    /// Ends a flow without sending the client anything (abortFlow resets
+    /// connections that are not open yet): the client gave up, or nothing
+    /// happened that the real network would have answered. The agent is told
+    /// unless it never heard of the flow.
+    fn dropFlow(self: *Tunnel, flow: *Flow, why: []const u8) void {
+        std.debug.assert(flow.pcb == null);
+        if (flow.tuple.proto == packet.proto_tcp) log.debug("{s}: dropped tcp flow to {any}:{d} ({s}): {s}", .{
+            self.name, flow.tuple.dst, flow.tuple.dport, @tagName(flow.state), why,
+        });
+        if (flow.state != .queued) {
+            if (self.session) |s| s.link.send(.reset, flow.id, &.{}) catch {};
+        }
+        self.destroyFlow(flow);
+    }
+
     fn destroyFlow(self: *Tunnel, flow: *Flow) void {
         self.endDial(flow);
         // lwIP may still hold the pcb (LAST_ACK/TIME_WAIT): keep routing the
@@ -833,6 +884,29 @@ pub const Tunnel = struct {
         self.gpa.destroy(flow);
     }
 };
+
+/// Whether a flow has waited too long for something that is not coming. A
+/// TCP flow lwIP has accepted is never stale here: lwIP and the agent end it.
+fn isStale(f: *const Flow, now: i64, dial_timeout_ms: i64) bool {
+    if (f.tuple.proto == packet.proto_udp) return now - f.last_active > udp_idle_ms;
+    if (f.pcb != null) return false;
+    return now - f.since > switch (f.state) {
+        // The client stopped retransmitting its SYN: it gave up.
+        .queued => queued_give_up_ms,
+        // The agent answers every connect; this is only a backstop.
+        .dialing => dial_timeout_ms + dial_answer_grace_ms,
+        // lwIP answered the SYN, but the client never completed the handshake.
+        .open => handshake_timeout_ms,
+    };
+}
+
+/// The client reset a connection that lwIP has answered but not handed to us
+/// yet. lwIP accepts that RST only with sequence number ISN+1 and then frees
+/// its half-open pcb without any callback, so we must end the flow (and the
+/// agent's real connection) ourselves.
+fn isResetBeforeAccept(f: *const Flow, seg: packet.Tcp) bool {
+    return seg.flags & packet.tcp_rst != 0 and f.state == .open and f.pcb == null and seg.seq == f.syn_seq +% 1;
+}
 
 /// Human-readable byte count, e.g. "12.3 MB".
 pub fn fmtBytes(buf: []u8, n: u64) []const u8 {
@@ -851,6 +925,58 @@ test fmtBytes {
     try std.testing.expectEqualStrings("512 B", fmtBytes(&b, 512));
     try std.testing.expectEqualStrings("1.5 KB", fmtBytes(&b, 1536));
     try std.testing.expectEqualStrings("50.0 MB", fmtBytes(&b, 50 * 1024 * 1024));
+}
+
+fn testFlow(state: @FieldType(Flow, "state"), since: i64) Flow {
+    return .{
+        .tunnel = undefined,
+        .id = 1,
+        .tuple = .{ .proto = packet.proto_tcp, .src = .{ 10, 0, 0, 2 }, .sport = 40000, .dst = .{ 10, 0, 0, 9 }, .dport = 80 },
+        .state = state,
+        .created = since,
+        .since = since,
+        .syn_seq = 1000,
+    };
+}
+
+test "stale flows: each wait is measured from its own state" {
+    const dial_timeout: i64 = 45_000; // longer than handshake_timeout_ms
+    // A long dial is not cut short; only an agent that never answers is.
+    var f = testFlow(.dialing, 0);
+    try std.testing.expect(!isStale(&f, 40_000, dial_timeout));
+    try std.testing.expect(isStale(&f, dial_timeout + dial_answer_grace_ms + 1, dial_timeout));
+    // A queued SYN stays while the client retransmits (each one refreshes `since`).
+    f = testFlow(.queued, 0);
+    try std.testing.expect(!isStale(&f, 90_000, dial_timeout));
+    try std.testing.expect(isStale(&f, queued_give_up_ms + 1, dial_timeout));
+    // After connect_ok the client gets the full handshake timeout from then on.
+    f = testFlow(.open, 50_000);
+    try std.testing.expect(!isStale(&f, 70_000, dial_timeout));
+    try std.testing.expect(isStale(&f, 50_000 + handshake_timeout_ms + 1, dial_timeout));
+    // A connection lwIP accepted is never swept.
+    f.pcb = @ptrFromInt(0x1000);
+    try std.testing.expect(!isStale(&f, 1_000_000_000, dial_timeout));
+    // UDP flows expire when idle.
+    f = testFlow(.open, 0);
+    f.tuple.proto = packet.proto_udp;
+    f.last_active = 10_000;
+    try std.testing.expect(!isStale(&f, 10_000 + udp_idle_ms, dial_timeout));
+    try std.testing.expect(isStale(&f, 10_000 + udp_idle_ms + 1, dial_timeout));
+}
+
+test "a client RST before lwIP accepted the connection ends the flow" {
+    var f = testFlow(.open, 0);
+    const rst: packet.Tcp = .{ .sport = 40000, .dport = 80, .seq = 1001, .flags = packet.tcp_rst };
+    try std.testing.expect(isResetBeforeAccept(&f, rst));
+    // lwIP ignores a RST with any other sequence number, and so do we.
+    try std.testing.expect(!isResetBeforeAccept(&f, .{ .sport = 40000, .dport = 80, .seq = 7, .flags = packet.tcp_rst }));
+    try std.testing.expect(!isResetBeforeAccept(&f, .{ .sport = 40000, .dport = 80, .seq = 1001, .flags = packet.tcp_ack }));
+    // Once accepted, lwIP reports the reset through onErr instead.
+    f.pcb = @ptrFromInt(0x1000);
+    try std.testing.expect(!isResetBeforeAccept(&f, rst));
+    // Before the SYN was replayed, lwIP has no connection to reset.
+    f = testFlow(.dialing, 0);
+    try std.testing.expect(!isResetBeforeAccept(&f, rst));
 }
 
 fn detachPcb(pcb: *c.struct_tcp_pcb) void {
