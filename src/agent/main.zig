@@ -114,7 +114,7 @@ fn envLayer(gpa: std.mem.Allocator) config.Layer {
     };
 }
 
-fn bakedLayer() config.Layer {
+pub fn bakedLayer() config.Layer {
     return .{
         .connect = baked.connect,
         .pubkey = baked.pubkey,
@@ -137,6 +137,26 @@ pub fn main() !void {
 
     const gpa = std.heap.smp_allocator;
     const args = try std.process.argsAlloc(gpa);
+
+    // -Dagent-service builds support install / uninstall subcommands and
+    // being launched by the Windows Service Control Manager. SCM invokes
+    // the exe with no extra arguments; a user installing or uninstalling
+    // passes an explicit subcommand.
+    if (baked.service and builtin.os.tag == .windows) {
+        const service = @import("service_windows.zig");
+        if (args.len >= 2) {
+            if (std.mem.eql(u8, args[1], "install-service")) {
+                try service.install(gpa);
+                return;
+            }
+            if (std.mem.eql(u8, args[1], "uninstall-service")) {
+                try service.uninstall();
+                return;
+            }
+        }
+        if (args.len == 1 and service.tryDispatch()) return;
+    }
+
     const layers = [_]config.Layer{ argLayer(args), envLayer(gpa), bakedLayer() };
     const cfg = config.resolve(&layers, std.time.milliTimestamp()) catch |err| switch (err) {
         error.MissingConnect => fatal("{s}", .{usage}),

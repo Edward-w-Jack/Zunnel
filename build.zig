@@ -127,6 +127,8 @@ pub fn build(b: *std.Build) void {
     agent_opts.addOption(?bool, "tls_verify", b.option(bool, "agent-tls-verify", "Bake in -tls-verify (require matching TLS cert)"));
     const agent_windowed = b.option(bool, "agent-windowed", "Windows agent built with the GUI subsystem (no console appears when run)") orelse false;
     agent_opts.addOption(bool, "windowed", agent_windowed);
+    const agent_service = b.option(bool, "agent-service", "Enable install-service / uninstall-service commands and SCM dispatch (Windows only)") orelse false;
+    agent_opts.addOption(bool, "service", agent_service);
 
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/main.zig"),
