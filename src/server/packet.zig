@@ -376,7 +376,7 @@ test "fragmentIp4 output reassembles back to the input" {
 test "two fragmented replies in flight reassemble separately" {
     const reassemble = @import("reassemble.zig");
     const gpa = std.testing.allocator;
-    // Both built like the proxy builds replies: same addresses, IP ID 0.
+    // Both built like the server builds replies: same addresses, IP ID 0.
     var data_a: [4000]u8 = undefined;
     var data_b: [4000]u8 = undefined;
     @memset(&data_a, 'a');

@@ -21,9 +21,9 @@ pub const Config = struct {
     expire_at_ms: ?i64,
     /// Overrides the host-derived identity.
     id: ?[]const u8,
-    /// If true, wrap the link in TLS (the proxy's default).
+    /// If true, wrap the link in TLS (the server's default).
     tls: bool,
-    /// If true, require the proxy's cert to match the host and chain to -ca.
+    /// If true, require the server's cert to match the host and chain to -ca.
     tls_verify: bool,
     /// Path to a CA bundle (PEM) for -tls-verify. null = no CA store loaded.
     ca_path: ?[]const u8,
@@ -147,7 +147,7 @@ test "precedence: args > env > baked" {
     const cfg = try resolve(&.{
         .{ .secret = "from-args" },
         .{ .connect = "10.0.0.1:443", .secret = "from-env" },
-        .{ .connect = "proxy.example:11601", .pubkey = key, .secret = "baked", .retry = true },
+        .{ .connect = "server.example:11601", .pubkey = key, .secret = "baked", .retry = true },
     }, 0);
     try std.testing.expectEqualStrings("10.0.0.1", cfg.host);
     try std.testing.expectEqual(@as(u16, 443), cfg.port);

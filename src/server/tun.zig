@@ -18,7 +18,7 @@ pub fn localAddress(index: u8) [4]u8 {
 pub const Tun = switch (builtin.os.tag) {
     .linux => @import("tun_linux.zig").Tun,
     .windows => @import("tun_windows.zig").Tun,
-    else => @compileError("zunnel-proxy supports Linux and Windows only"),
+    else => @compileError("zunnel-server supports Linux and Windows only"),
 };
 
 /// Runs a helper command (ip / netsh), returning an error with its output on failure.

@@ -1,4 +1,4 @@
-//! Accepts agent connections and owns the proxy's shared state: sessions,
+//! Accepts agent connections and owns the server's shared state: sessions,
 //! tunnels and listeners.
 const std = @import("std");
 const common = @import("common");
@@ -35,7 +35,7 @@ pub const Session = struct {
     joined_ms: i64 = 0,
     /// Upstream agent this session was relayed through (see `relay` command).
     via: ?u32 = null,
-    /// Flows accepted by this agent's listeners, dialed on the proxy side.
+    /// Flows accepted by this agent's listeners, dialed on the server side.
     relay: *relay.Table,
     /// Next id for TUN flows / pings (guarded by netstack.lock).
     next_flow_id: u32 = 1,
@@ -414,7 +414,7 @@ pub const Server = struct {
                 if (net.mask == 0xffffffff or ip[0] == 127 or (ip[0] == 169 and ip[1] == 254)) continue;
                 const is_uplink = if (uplink) |u| net.contains(u) else false;
                 if (is_uplink) {
-                    suggestions.print(self.gpa, "      {f}  (agent's link to the proxy; don't route)\n", .{net}) catch {};
+                    suggestions.print(self.gpa, "      {f}  (agent's link to the server; don't route)\n", .{net}) catch {};
                 } else suggestions.print(self.gpa, "      route add {f} {s}\n", .{ net, iface }) catch {};
             }
         }
@@ -475,7 +475,7 @@ pub const Server = struct {
                 for (self.tunnels.items) |t| {
                     if (t.index == idx) break;
                 } else {
-                    // Skip addresses another program (e.g. a second proxy) already uses.
+                    // Skip addresses another program (e.g. a second server) already uses.
                     if (!sock.isLocalAddress(tun.localAddress(idx))) break :blk idx;
                 }
             }

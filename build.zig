@@ -116,14 +116,14 @@ pub fn build(b: *std.Build) void {
     // Settings baked into the agent so it runs without arguments. Flags and
     // ZUNNEL_* environment variables still override them.
     const agent_opts = b.addOptions();
-    agent_opts.addOption(?[]const u8, "connect", b.option([]const u8, "agent-connect", "Bake in the proxy address (host:port)"));
-    agent_opts.addOption(?[]const u8, "pubkey", b.option([]const u8, "agent-pubkey", "Bake in the proxy public key"));
+    agent_opts.addOption(?[]const u8, "connect", b.option([]const u8, "agent-connect", "Bake in the server address (host:port)"));
+    agent_opts.addOption(?[]const u8, "pubkey", b.option([]const u8, "agent-pubkey", "Bake in the server public key"));
     agent_opts.addOption(?[]const u8, "secret", b.option([]const u8, "agent-secret", "Bake in the shared secret"));
     agent_opts.addOption(?[]const u8, "expire", b.option([]const u8, "agent-expire", "Bake in an expiry (UTC time or duration)"));
     agent_opts.addOption(?[]const u8, "id", b.option([]const u8, "agent-id", "Bake in an agent id (default: derived from the host)"));
     agent_opts.addOption(?[]const u8, "ca", b.option([]const u8, "agent-ca", "Bake in a path to a PEM CA bundle"));
     agent_opts.addOption(?bool, "retry", b.option(bool, "agent-retry", "Reconnect forever (default: on when -Dagent-connect is set)"));
-    agent_opts.addOption(?bool, "no_tls", b.option(bool, "agent-no-tls", "Bake in -no-tls (raw TCP, matches proxy -no-tls)"));
+    agent_opts.addOption(?bool, "no_tls", b.option(bool, "agent-no-tls", "Bake in -no-tls (raw TCP, matches server -no-tls)"));
     agent_opts.addOption(?bool, "tls_verify", b.option(bool, "agent-tls-verify", "Bake in -tls-verify (require matching TLS cert)"));
     const agent_windowed = b.option(bool, "agent-windowed", "Windows agent built with the GUI subsystem (no console appears when run)") orelse false;
     agent_opts.addOption(bool, "windowed", agent_windowed);
@@ -180,7 +180,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // --------------------------------------------------------------- mbedTLS
-    // The proxy's TLS 1.3 transport runs on mbedTLS. The agent uses Zig's
+    // The server's TLS 1.3 transport runs on mbedTLS. The agent uses Zig's
     // std.crypto.tls.Client (phase 5), so the agent never links mbedTLS.
     const mbedtls_dep = b.dependency("mbedtls", .{});
     const mbedtls = b.addLibrary(.{
@@ -204,43 +204,43 @@ pub fn build(b: *std.Build) void {
         mbedtls.root_module.linkSystemLibrary("ws2_32", .{});
     }
 
-    // ---------------------------------------------------------------- proxy
-    const proxy_mod = b.createModule(.{
-        .root_source_file = b.path("src/proxy/main.zig"),
+    // ---------------------------------------------------------------- server
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/main.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .link_libc = true,
         .imports = &.{.{ .name = "common", .module = common }},
     });
-    proxy_mod.addIncludePath(b.path("src/lwip"));
-    proxy_mod.addIncludePath(lwip_dep.path("src/include"));
-    proxy_mod.addIncludePath(mbedtls_dep.path("include"));
-    proxy_mod.linkLibrary(lwip);
-    proxy_mod.linkLibrary(mbedtls);
-    const proxy = b.addExecutable(.{ .name = "zunnel-proxy", .root_module = proxy_mod });
-    b.installArtifact(proxy);
+    server_mod.addIncludePath(b.path("src/lwip"));
+    server_mod.addIncludePath(lwip_dep.path("src/include"));
+    server_mod.addIncludePath(mbedtls_dep.path("include"));
+    server_mod.linkLibrary(lwip);
+    server_mod.linkLibrary(mbedtls);
+    const server = b.addExecutable(.{ .name = "zunnel-server", .root_module = server_mod });
+    b.installArtifact(server);
 
     // ------------------------------------------------------------- run/test
-    const run_proxy = b.addRunArtifact(proxy);
+    const run_server = b.addRunArtifact(server);
     const run_agent = b.addRunArtifact(agent);
     if (b.args) |args| {
-        run_proxy.addArgs(args);
+        run_server.addArgs(args);
         run_agent.addArgs(args);
     }
-    b.step("proxy", "Run the proxy").dependOn(&run_proxy.step);
+    b.step("server", "Run the server").dependOn(&run_server.step);
     b.step("agent", "Run the agent").dependOn(&run_agent.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = common })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = proxy_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = agent_mod })).step);
 
-    // Zig 0.15's fuzzer cannot instrument the proxy test binary (it links libc
+    // Zig 0.15's fuzzer cannot instrument the server test binary (it links libc
     // and lwIP), so fuzzing gets its own step with only pure-Zig parsers:
     // `zig build fuzz --fuzz` (Linux). Without --fuzz it runs the tests once.
     const packet_mod = b.createModule(.{
-        .root_source_file = b.path("src/proxy/packet.zig"),
+        .root_source_file = b.path("src/server/packet.zig"),
         .target = target,
         .optimize = optimize,
     });

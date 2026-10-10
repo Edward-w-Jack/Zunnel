@@ -1,4 +1,4 @@
-//! TLS 1.3 server for the proxy's listening port, so new connections look
+//! TLS 1.3 on zunnel-server's listening port, so new connections look
 //! like HTTPS on the wire. Noise still authenticates inside, so the TLS
 //! layer here is camouflage: a self-signed cert is generated on first run.
 //!
@@ -47,7 +47,7 @@ fn logMbedErr(prefix: []const u8, ret: c_int) void {
     log.err("{s}: {s} (-0x{x:0>4})", .{ prefix, text, @as(u32, @intCast(-ret)) });
 }
 
-/// Shared state for every TLS session the proxy accepts: the certificate
+/// Shared state for every TLS session the server accepts: the certificate
 /// chain, the private key, the shared config, and a seeded CTR_DRBG.
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -89,7 +89,7 @@ pub const Server = struct {
             self.psa_inited = true;
         }
 
-        const seed = "zunnel-proxy-tls";
+        const seed = "zunnel-server-tls";
         var ret = c.mbedtls_ctr_drbg_seed(&self.drbg, c.mbedtls_entropy_func, &self.entropy, seed, seed.len);
         if (ret != 0) {
             logMbedErr("ctr_drbg_seed", ret);
@@ -455,7 +455,7 @@ const TlsServerFixture = struct {
     }
 };
 
-test "proxy TLS: self-signed cert + handshake against std.crypto.tls.Client" {
+test "server TLS: self-signed cert + handshake against std.crypto.tls.Client" {
     // Use a scratch directory for the generated cert/key files so repeated
     // runs don't leave anything in the repo root.
     const gpa = std.testing.allocator;

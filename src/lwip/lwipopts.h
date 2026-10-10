@@ -1,4 +1,4 @@
-/* lwIP configuration for the zunnel proxy netstack.
+/* lwIP configuration for the zunnel server netstack.
  *
  * lwIP only terminates TCP here; UDP and ICMP are handled directly in Zig.
  * All lwIP calls are serialised by a single mutex on the Zig side, so we run

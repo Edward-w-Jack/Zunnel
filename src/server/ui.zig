@@ -36,7 +36,7 @@ pub fn openLog(path: []const u8) !void {
     defer file_mutex.unlock();
     log_file = f;
     var stamp = logfmt.now();
-    f.writeAll("--- zunnel proxy started ") catch {};
+    f.writeAll("--- zunnel server started ") catch {};
     f.writeAll(&stamp) catch {};
     f.writeAll(" ---\n") catch {};
 }
@@ -103,7 +103,7 @@ pub fn event(comptime format: []const u8, args: anytype) void {
     toFile(std.fmt.bufPrint(&line_buf, "{s} {s}\n", .{ &stamp, msg }) catch return);
 }
 
-/// `std_options.logFn` for the proxy.
+/// `std_options.logFn` for the server.
 pub fn logFn(
     comptime message_level: std.log.Level,
     comptime scope: @Type(.enum_literal),

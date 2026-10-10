@@ -1,4 +1,4 @@
-//! zunnel-proxy: runs on the operator machine. Accepts agents, exposes TUN
+//! zunnel-server: runs on the operator machine. Accepts agents, exposes TUN
 //! interfaces routed through them, and manages listeners on the agents.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,10 +21,10 @@ const Allocator = std.mem.Allocator;
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = ui.logFn };
 
 const usage =
-    \\usage: zunnel-proxy [options]
+    \\usage: zunnel-server [options]
     \\
     \\  -listen <addr:port>  address agents connect to (default 0.0.0.0:11601)
-    \\  -key <file>          proxy key and shared secret, created if missing (default zunnel.key)
+    \\  -key <file>          server key and shared secret, created if missing (default zunnel.key)
     \\  -secret <secret>     override the shared secret stored in the key file
     \\  -no-secret           accept agents without a secret (not recommended)
     \\  -no-tls              accept raw TCP only (no TLS; agents need -no-tls too)
@@ -171,7 +171,7 @@ pub fn main() !void {
 
     const port = opts.listen.getPort();
     const transport_desc = if (tls_server == null) " (TLS off; agents need -no-tls)" else "";
-    std.debug.print("zunnel proxy {s} listening on {f}{s}\npublic key: {s}\n", .{ common.version, opts.listen, transport_desc, &pubkey });
+    std.debug.print("zunnel server {s} listening on {f}{s}\npublic key: {s}\n", .{ common.version, opts.listen, transport_desc, &pubkey });
     const agent_tls_flag: []const u8 = if (tls_server == null) " -no-tls" else "";
     if (secret.len > 0) {
         std.debug.print(
@@ -256,7 +256,7 @@ const help_text =
     \\  route del <cidr> [iface]                   remove a route
     \\  listener add <agent> <tcp|udp> <bind> <target>
     \\                                             listen on the agent; connections are
-    \\                                             forwarded to <target>, dialed by the proxy
+    \\                                             forwarded to <target>, dialed by the server
     \\  listener del <id>                          remove a listener
     \\  listeners                                  list listeners
     \\  relay <agent> [bind]                       let deeper agents connect through
@@ -931,7 +931,7 @@ const Console = struct {
         const server = self.server;
         server.mutex.lock();
         defer server.mutex.unlock();
-        try w.writeAll("# zunnel proxy configuration, written by `save`; load with -config <file>\n");
+        try w.writeAll("# zunnel server configuration, written by `save`; load with -config <file>\n");
         for (server.tunnels.items) |t| {
             try w.print("iface add {s} {f}\n", .{ t.name, t.localhost_net });
             for (t.routes.items) |r| try w.print("route add {s} {s}\n", .{ r, t.name });
@@ -951,7 +951,7 @@ const Console = struct {
         else
             std.net.Address.initIp4(.{ 0, 0, 0, 0 }, common.proto.default_port);
         if (!self.addListener(agent_arg, .tcp, bind, self.server.relayTarget(), true)) return;
-        std.debug.print("deeper agents can now run: zunnel-agent -connect <agent-ip>:{d} -pubkey <this proxy's key>\n", .{bind.getPort()});
+        std.debug.print("deeper agents can now run: zunnel-agent -connect <agent-ip>:{d} -pubkey <this server's key>\n", .{bind.getPort()});
     }
 };
 

@@ -1,4 +1,4 @@
-//! The agent core: connects to the proxy, serves sessions and reconnects.
+//! The agent core: connects to the server, serves sessions and reconnects.
 //! It never exits the process or requires a console, so the same code backs
 //! the command-line agent and (later) a DLL build.
 const std = @import("std");
@@ -25,7 +25,7 @@ pub var quiet = false;
 pub const RunResult = enum {
     /// `stop` was set by the embedder.
     stopped,
-    /// The proxy sent `kill`.
+    /// The server sent `kill`.
     killed,
     /// The `expire` deadline passed.
     expired,
@@ -97,7 +97,7 @@ fn currentPid() u64 {
     };
 }
 
-/// Plain `key=value` lines describing this host, shown in the proxy console.
+/// Plain `key=value` lines describing this host, shown in the server console.
 fn buildHello(gpa: Allocator, cfg: Config) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -185,7 +185,7 @@ fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop:
     // The watchdog may close the link until it has exited: free it only then.
     if (watchdog) |t| t.join();
     session.link.destroy();
-    log.info("connection to proxy closed", .{});
+    log.info("connection to server closed", .{});
     return session.end.load(.acquire);
 }
 
@@ -258,7 +258,7 @@ const Session = struct {
             .listener_del => if (self.listeners.fetchRemove(frame.id)) |kv| kv.value.stop(),
             .info_request => self.sendInfo(frame.id),
             .kill => {
-                log.info("killed by the proxy", .{});
+                log.info("killed by the server", .{});
                 self.finish(.killed);
                 return error.Killed;
             },
@@ -266,7 +266,7 @@ const Session = struct {
         }
     }
 
-    /// Answers the proxy's `ifconfig` with this host's interfaces.
+    /// Answers the server's `ifconfig` with this host's interfaces.
     fn sendInfo(self: *Session, id: u32) void {
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
@@ -323,29 +323,29 @@ const Session = struct {
 };
 
 fn targetAddress(req: proto.ConnectRequest) std.net.Address {
-    // 240.0.0.0/4 is the agent's own loopback (proxies also remap their -localhost-net).
+    // 240.0.0.0/4 is the agent's own loopback (servers also remap their -localhost-net).
     if (req.addr.len == 4 and req.addr[0] & 0xf0 == proto.magic_localhost_net[0])
         return std.net.Address.initIp4(.{ 127, 0, 0, 1 }, req.port);
     return proto.endpointAddress(req);
 }
 
-/// A minimal proxy for tests: accepts one agent, optionally kills it, then
+/// A minimal server for tests: accepts one agent, optionally kills it, then
 /// serves until the agent hangs up.
-const FakeProxy = struct {
+const FakeServer = struct {
     listener: *std.net.Server,
     key: common.noise.KeyPair,
     send_kill: bool,
     up: std.atomic.Value(bool) = .init(false),
     err: ?anyerror = null,
 
-    fn serve(self: *FakeProxy) void {
+    fn serve(self: *FakeServer) void {
         self.serveInner() catch |err| {
             self.err = err;
         };
         self.up.store(true, .release); // also on failure, so stopWhenUp ends
     }
 
-    fn serveInner(self: *FakeProxy) !void {
+    fn serveInner(self: *FakeServer) !void {
         const conn = try self.listener.accept();
         var hello_buf: [common.link.max_hello_len]u8 = undefined;
         const psk = common.noise.pskFromSecret("s3cret");
@@ -364,13 +364,13 @@ const FakeProxy = struct {
         while (true) _ = hs.link.recvFrame() catch break;
     }
 
-    fn stopWhenUp(self: *FakeProxy, stop: *std.atomic.Value(bool)) void {
+    fn stopWhenUp(self: *FakeServer, stop: *std.atomic.Value(bool)) void {
         while (!self.up.load(.acquire)) std.Thread.sleep(5 * std.time.ns_per_ms);
         stop.store(true, .release);
     }
 };
 
-test "run ends cleanly when the proxy kills the agent or the embedder stops it" {
+test "run ends cleanly when the server kills the agent or the embedder stops it" {
     // std.testing.allocator fails the test if the link is leaked or freed twice.
     const key = common.noise.KeyPair.generate();
     var listener = try common.sock.listenTcp(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0), 4);
@@ -383,19 +383,19 @@ test "run ends cleanly when the proxy kills the agent or the embedder stops it" 
         .retry = false,
         .expire_at_ms = null,
         .id = "test-agent",
-        .tls = false, // the test proxy speaks raw TCP (ZNL6)
+        .tls = false, // the test server speaks raw TCP (ZNL6)
         .tls_verify = false,
         .ca_path = null,
     };
     for ([_]RunResult{ .killed, .stopped }) |want| {
-        var proxy: FakeProxy = .{ .listener = &listener, .key = key, .send_kill = want == .killed };
-        const proxy_thread = try std.Thread.spawn(.{}, FakeProxy.serve, .{&proxy});
+        var server: FakeServer = .{ .listener = &listener, .key = key, .send_kill = want == .killed };
+        const server_thread = try std.Thread.spawn(.{}, FakeServer.serve, .{&server});
         var stop = std.atomic.Value(bool).init(false);
-        const stopper = if (want == .stopped) try std.Thread.spawn(.{}, FakeProxy.stopWhenUp, .{ &proxy, &stop }) else null;
+        const stopper = if (want == .stopped) try std.Thread.spawn(.{}, FakeServer.stopWhenUp, .{ &server, &stop }) else null;
         const got = run(std.testing.allocator, cfg, &stop);
         if (stopper) |t| t.join();
-        proxy_thread.join();
-        if (proxy.err) |err| return err;
+        server_thread.join();
+        if (server.err) |err| return err;
         try std.testing.expectEqual(want, got);
     }
 }

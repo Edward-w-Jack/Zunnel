@@ -3,7 +3,7 @@
 //! Every record carries one or more frames:
 //!   type: u8 | flags: u8 | id: u32be | len: u16be | payload[len]
 //!
-//! `id` names a forwarded flow. The proxy allocates ids below `agent_id_bit`
+//! `id` names a forwarded flow. The server allocates ids below `agent_id_bit`
 //! (TUN flows, ICMP requests, listener ids); the agent allocates ids with
 //! `agent_id_bit` set (connections accepted by its listeners).
 const std = @import("std");
@@ -26,18 +26,18 @@ pub const header_len = 8;
 pub const max_payload = 65_507;
 /// Per-flow, per-direction flow-control window for TCP flows.
 pub const initial_window: u32 = 256 * 1024;
-/// 240.0.0.0/4 on the proxy side is mapped to the agent's own 127.0.0.1.
+/// 240.0.0.0/4 on the server side is mapped to the agent's own 127.0.0.1.
 pub const magic_localhost_net = [4]u8{ 240, 0, 0, 0 };
 pub const agent_id_bit: u32 = 0x8000_0000;
 
 pub const FrameType = enum(u8) {
     ping = 1,
     pong = 2,
-    /// proxy -> agent: open a flow (payload: ConnectRequest)
+    /// server -> agent: open a flow (payload: ConnectRequest)
     connect = 3,
-    /// agent -> proxy: flow is open
+    /// agent -> server: flow is open
     connect_ok = 4,
-    /// agent -> proxy: flow failed (payload: FailReason)
+    /// agent -> server: flow failed (payload: FailReason)
     connect_fail = 5,
     /// bytes (TCP) or one datagram (UDP)
     data = 6,
@@ -47,29 +47,29 @@ pub const FrameType = enum(u8) {
     fin = 8,
     /// abort the flow in both directions
     reset = 9,
-    /// proxy -> agent: ping an address (payload: IcmpEcho)
+    /// server -> agent: ping an address (payload: IcmpEcho)
     icmp_echo = 10,
-    /// agent -> proxy: result (payload: ok u8 | rtt_ms u16be)
+    /// agent -> server: result (payload: ok u8 | rtt_ms u16be)
     icmp_reply = 11,
-    /// proxy -> agent: open a listener; id = listener id (payload: Endpoint, bind address)
+    /// server -> agent: open a listener; id = listener id (payload: Endpoint, bind address)
     listener_add = 12,
     listener_ok = 13,
-    /// agent -> proxy (payload: error text)
+    /// agent -> server (payload: error text)
     listener_fail = 14,
-    /// proxy -> agent: close a listener
+    /// server -> agent: close a listener
     listener_del = 15,
-    /// agent -> proxy: a listener accepted a connection/association; id = new
-    /// flow id (payload: listener id u32be | Endpoint of the peer). The proxy
+    /// agent -> server: a listener accepted a connection/association; id = new
+    /// flow id (payload: listener id u32be | Endpoint of the peer). The server
     /// answers with connect_ok / connect_fail like the agent does for `connect`.
     accepted = 16,
-    /// agent -> proxy: the target answered a UDP flow with ICMP unreachable
+    /// agent -> server: the target answered a UDP flow with ICMP unreachable
     /// (payload: ICMP code u8, 3 = port unreachable). The flow stays open.
     icmp_unreachable = 17,
-    /// proxy -> agent: shut down for good (no reconnect)
+    /// server -> agent: shut down for good (no reconnect)
     kill = 18,
-    /// proxy -> agent: request host information (id = request id)
+    /// server -> agent: request host information (id = request id)
     info_request = 19,
-    /// agent -> proxy: host information as `key=value` lines
+    /// agent -> server: host information as `key=value` lines
     info_reply = 20,
     _,
 };

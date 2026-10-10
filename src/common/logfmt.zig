@@ -1,4 +1,4 @@
-//! Log formatting shared by the proxy and the agent: UTC timestamps
+//! Log formatting shared by the server and the agent: UTC timestamps
 //! (`2026-10-09 14:07:00Z`) so logs from different machines line up.
 const std = @import("std");
 

@@ -24,7 +24,7 @@ pub fn decode(text: []const u8) error{InvalidKey}![noise.key_len]u8 {
 /// so it pastes into any shell without quoting).
 pub const secret_len = 32;
 
-pub const ProxyIdentity = struct {
+pub const ServerIdentity = struct {
     keypair: noise.KeyPair,
     /// Shared secret agents must present.
     secret: [secret_len]u8,
@@ -34,14 +34,14 @@ pub const ProxyIdentity = struct {
     added_secret: bool,
 };
 
-/// Loads the proxy's private key and shared secret from `path`:
+/// Loads the server's private key and shared secret from `path`:
 ///
 ///     <base64 private key>
 ///     secret=<32 chars>
 ///
 /// Creates the file if it is missing, and appends a fresh secret to key-only
 /// files written by older versions.
-pub fn loadOrCreate(path: []const u8) !ProxyIdentity {
+pub fn loadOrCreate(path: []const u8) !ServerIdentity {
     var buf: [512]u8 = undefined;
     if (std.fs.cwd().readFile(path, &buf)) |contents| {
         const parsed = try parseKeyFile(contents);

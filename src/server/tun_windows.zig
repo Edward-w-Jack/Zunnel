@@ -1,5 +1,5 @@
 //! Windows TUN via Wintun (https://www.wintun.net). wintun.dll must sit next to
-//! zunnel-proxy.exe (or in System32), and the proxy must run as Administrator.
+//! zunnel-server.exe (or in System32), and the server must run as Administrator.
 const std = @import("std");
 const tun = @import("tun.zig");
 const windows = std.os.windows;
@@ -36,7 +36,7 @@ const Api = struct {
     fn load() !Api {
         const dll = std.unicode.utf8ToUtf16LeStringLiteral("wintun.dll");
         const module = LoadLibraryExW(dll, null, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) orelse {
-            std.log.err("wintun.dll not found; download it from https://www.wintun.net and place it next to zunnel-proxy.exe", .{});
+            std.log.err("wintun.dll not found; download it from https://www.wintun.net and place it next to zunnel-server.exe", .{});
             return error.WintunNotFound;
         };
         var api: Api = undefined;
@@ -63,7 +63,7 @@ pub const Tun = struct {
 
         const adapter = api.WintunOpenAdapter(wname) orelse
             api.WintunCreateAdapter(wname, std.unicode.utf8ToUtf16LeStringLiteral("zunnel"), null) orelse {
-            std.log.err("WintunCreateAdapter failed (error {d}); is the proxy running as Administrator?", .{GetLastError()});
+            std.log.err("WintunCreateAdapter failed (error {d}); is the server running as Administrator?", .{GetLastError()});
             return error.AdapterCreateFailed;
         };
         errdefer api.WintunCloseAdapter(adapter);

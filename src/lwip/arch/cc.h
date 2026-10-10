@@ -1,5 +1,5 @@
 /* lwIP architecture glue for zunnel. The referenced functions are exported
- * from Zig (src/proxy/netstack.zig). */
+ * from Zig (src/server/netstack.zig). */
 #ifndef ZUNNEL_ARCH_CC_H
 #define ZUNNEL_ARCH_CC_H
 

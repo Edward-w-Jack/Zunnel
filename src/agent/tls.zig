@@ -2,7 +2,7 @@
 //! The Stream it returns is what the Noise handshake runs over, so from
 //! `link.zig`'s viewpoint there's no difference between TCP and TLS.
 //!
-//! The Noise handshake inside already authenticates the proxy, so hostname
+//! The Noise handshake inside already authenticates the server, so hostname
 //! and CA verification are off by default (`host: .no_verification`,
 //! `ca: .no_verification`). `-tls-verify` and `-ca` enable them for operators
 //! who want TLS to look like a normal HTTPS client, with a real cert chain.
@@ -20,7 +20,7 @@ const min_buf = std.crypto.tls.Client.min_buffer_len;
 pub const Options = struct {
     /// Set to the hostname when hostname verification is wanted (-tls-verify).
     host: ?[]const u8 = null,
-    /// A trust bundle to verify the proxy's cert against (-ca <file>).
+    /// A trust bundle to verify the server's cert against (-ca <file>).
     ca: ?std.crypto.Certificate.Bundle = null,
 };
 

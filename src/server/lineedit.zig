@@ -1,4 +1,4 @@
-//! A small line editor for the proxy console: cursor movement, editing keys,
+//! A small line editor for the server console: cursor movement, editing keys,
 //! history and tab completion. `Editor` is pure (bytes in, actions out) so it
 //! can be unit-tested; `Terminal` switches the console into raw mode.
 const std = @import("std");

@@ -1,6 +1,6 @@
-//! Listeners opened on the agent at the proxy's request. Every accepted TCP
+//! Listeners opened on the agent at the server's request. Every accepted TCP
 //! connection / UDP source address becomes a relay flow announced with
-//! `accepted`; the proxy dials the listener's target on its side.
+//! `accepted`; the server dials the listener's target on its side.
 const std = @import("std");
 const common = @import("common");
 

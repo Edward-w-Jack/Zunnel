@@ -1,10 +1,10 @@
-//! The encrypted, framed connection between proxy and agent.
+//! The encrypted, framed connection between server and agent.
 //!
 //! Handshake on a fresh connection (over whatever `Stream` the caller passes:
 //! raw TCP, or TLS as of ZNL6). The agent speaks first — no cleartext bytes
-//! leave the proxy until it has read a valid message 1:
-//!   agent -> proxy : u16be len | Noise message 1 (payload: agent hello)
-//!   proxy -> agent : u16be len | Noise message 2
+//! leave the server until it has read a valid message 1:
+//!   agent -> server : u16be len | Noise message 1 (payload: agent hello)
+//!   server -> agent : u16be len | Noise message 2
 //!
 //! The protocol version is mixed into the Noise prologue, so a mismatch fails
 //! the AEAD tag like a wrong secret would.
@@ -320,8 +320,8 @@ pub const ClientResult = struct { link: *Link };
 
 /// Agent side. The agent speaks first — nothing is received before the
 /// agent's message 1 is sent — so the stream carries no cleartext bytes from
-/// the proxy that could identify the protocol. `server_key` must match the
-/// proxy's static key, otherwise message 2 fails with `AuthenticationFailed`.
+/// the server that could identify the protocol. `server_key` must match the
+/// server's static key, otherwise message 2 fails with `AuthenticationFailed`.
 /// On success the link owns `s`.
 pub fn clientHandshake(
     gpa: Allocator,
@@ -347,7 +347,7 @@ pub const ServerResult = struct {
     hello: []u8,
 };
 
-/// Proxy side. On success the link owns `s` and `hello` points into `hello_buf`.
+/// Server side. On success the link owns `s` and `hello` points into `hello_buf`.
 pub fn serverHandshake(
     gpa: Allocator,
     s: Stream,
@@ -412,7 +412,7 @@ const HandshakeFixture = struct {
 };
 
 /// Test helper: two Links joined over loopback TCP, past the handshake. The
-/// first is the agent's end, the second the proxy's; the caller destroys both.
+/// first is the agent's end, the second the server's; the caller destroys both.
 pub fn testPair(gpa: Allocator) !struct { *Link, *Link } {
     const static = noise.KeyPair.generate();
     const psk = noise.pskFromSecret("test");
@@ -431,11 +431,11 @@ pub fn testPair(gpa: Allocator) !struct { *Link, *Link } {
         if (server_link) |l| l.destroy();
         return err;
     }).link;
-    const proxy = server_link orelse {
+    const server_end = server_link orelse {
         agent.destroy();
         return error.HandshakeFailed;
     };
-    return .{ agent, proxy };
+    return .{ agent, server_end };
 }
 
 test "a max-size UDP-ish frame survives the record layer" {
@@ -504,7 +504,7 @@ fn expectHandshakeRejection(client: PairSide, want: anytype, server: *std.Thread
     try std.testing.expect(server_link.* == null);
 }
 
-test "ZNL6 handshake rejects a wrong proxy public key" {
+test "ZNL6 handshake rejects a wrong server public key" {
     const gpa = std.testing.allocator;
     const static = noise.KeyPair.generate();
     const other = noise.KeyPair.generate();

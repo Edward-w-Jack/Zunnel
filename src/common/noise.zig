@@ -6,8 +6,8 @@
 //!     -> psk, e, es
 //!     <- e, ee
 //!
-//! The agent (initiator) knows the proxy's static key up front. The psk is
-//! mixed in before message 1, so the proxy rejects an agent with the wrong
+//! The agent (initiator) knows the server's static key up front. The psk is
+//! mixed in before message 1, so the server rejects an agent with the wrong
 //! secret before accepting it. When no secret is configured an all-zero psk is
 //! used, which degrades to plain NK security.
 const std = @import("std");

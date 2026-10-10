@@ -44,7 +44,7 @@ const default_dial_timeout_ms: u32 = proto.default_dial_timeout_ms;
 /// Return flow-control credit to the peer in batches of at least this much.
 const window_batch: u32 = 32 * 1024;
 
-/// Called after a successful outgoing TCP dial (used by the proxy to track relays).
+/// Called after a successful outgoing TCP dial (used by the server to track relays).
 pub const DialHook = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, target: std.net.Address, h: sock.Handle) void,

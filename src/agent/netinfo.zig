@@ -1,4 +1,4 @@
-//! Lists the agent host's network interfaces for the proxy's `ifconfig`,
+//! Lists the agent host's network interfaces for the server's `ifconfig`,
 //! without privileges. Output is plain text, one item per line:
 //!
 //!     iface=<name> <addr>/<prefix> [<addr>/<prefix> ...]

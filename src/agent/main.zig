@@ -1,4 +1,4 @@
-//! zunnel-agent: runs on the remote host, connects back to the proxy and dials
+//! zunnel-agent: runs on the remote host, connects back to the server and dials
 //! TCP/UDP flows on its behalf. Needs no privileges.
 //!
 //! Settings come from flags, then ZUNNEL_* environment variables, then values
@@ -30,21 +30,21 @@ fn logFn(
 const usage =
     \\usage: zunnel-agent -connect <host:port> -pubkey <key> [options]
     \\
-    \\  -connect <host:port>  proxy address                       (env ZUNNEL_CONNECT)
-    \\  -pubkey <key>         proxy public key (base64)           (env ZUNNEL_PUBKEY)
-    \\  -secret <secret>      shared secret printed by the proxy  (env ZUNNEL_SECRET)
+    \\  -connect <host:port>  server address                      (env ZUNNEL_CONNECT)
+    \\  -pubkey <key>         server public key (base64)          (env ZUNNEL_PUBKEY)
+    \\  -secret <secret>      shared secret printed by the server (env ZUNNEL_SECRET)
     \\  -retry                reconnect forever when the connection drops
     \\  -expire <when>        stop for good at a UTC time (2026-10-20T18:00Z)
     \\                        or after a duration (90m, 72h, 7d)  (env ZUNNEL_EXPIRE)
     \\  -id <id>              override the host-derived agent id  (env ZUNNEL_ID)
-    \\  -no-tls               use raw TCP instead of TLS; proxy needs -no-tls too
-    \\  -tls-verify           require the proxy's TLS cert to match -connect's host
+    \\  -no-tls               use raw TCP instead of TLS; server needs -no-tls too
+    \\  -tls-verify           require the server's TLS cert to match -connect's host
     \\  -ca <file>            PEM CA bundle used with -tls-verify
     \\  -q                    quiet: print nothing
     \\  -v                    verbose: also log each failed dial and port-unreachable
     \\
     \\Settings may also be baked in at build time, e.g.
-    \\  zig build -Drelease -Dagent-connect=proxy:11601 -Dagent-pubkey=<key> -Dagent-secret=<secret>
+    \\  zig build -Drelease -Dagent-connect=server:11601 -Dagent-pubkey=<key> -Dagent-secret=<secret>
     \\
 ;
 
