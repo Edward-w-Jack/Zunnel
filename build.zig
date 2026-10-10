@@ -125,6 +125,8 @@ pub fn build(b: *std.Build) void {
     agent_opts.addOption(?bool, "retry", b.option(bool, "agent-retry", "Reconnect forever (default: on when -Dagent-connect is set)"));
     agent_opts.addOption(?bool, "no_tls", b.option(bool, "agent-no-tls", "Bake in -no-tls (raw TCP, matches proxy -no-tls)"));
     agent_opts.addOption(?bool, "tls_verify", b.option(bool, "agent-tls-verify", "Bake in -tls-verify (require matching TLS cert)"));
+    const agent_windowed = b.option(bool, "agent-windowed", "Windows agent built with the GUI subsystem (no console appears when run)") orelse false;
+    agent_opts.addOption(bool, "windowed", agent_windowed);
 
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/main.zig"),
@@ -137,6 +139,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const agent = b.addExecutable(.{ .name = "zunnel-agent", .root_module = agent_mod });
+    if (agent_windowed and target.result.os.tag == .windows) agent.subsystem = .Windows;
     b.installArtifact(agent);
 
     // ----------------------------------------------------------------- lwIP

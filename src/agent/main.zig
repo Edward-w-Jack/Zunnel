@@ -130,6 +130,11 @@ fn bakedLayer() config.Layer {
 }
 
 pub fn main() !void {
+    // -Dagent-windowed builds use the Windows GUI subsystem: there is no
+    // console to print to on launch, so silence the log channel. Operators
+    // who need output can still start it from a terminal and use `-v`.
+    if (baked.windowed and builtin.os.tag == .windows) agent.quiet = true;
+
     const gpa = std.heap.smp_allocator;
     const args = try std.process.argsAlloc(gpa);
     const layers = [_]config.Layer{ argLayer(args), envLayer(gpa), bakedLayer() };
