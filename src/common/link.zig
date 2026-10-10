@@ -29,9 +29,10 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.link);
 
 /// Record plaintext layout: 2 bytes of real-content length, then the frames,
-/// then padding to the next `record_bucket` multiple. The 2 bytes are counted
-/// in `max_record_plain` so the maximum ciphertext record size stays the same.
-const max_record_plain = 60 * 1024;
+/// then padding to the next `record_bucket` multiple. The on-wire record is
+/// `u16be len | ciphertext`, so `max_record` tops out just under 2^16 to fit
+/// a `u16be` length prefix. The plaintext budget is `max_record - tag_len`.
+const max_record_plain = 65_535 - noise.tag_len;
 const max_frames_plain = max_record_plain - 2;
 const max_record = max_record_plain + noise.tag_len;
 /// Every record on the wire (ciphertext + 2-byte length prefix) is at least
@@ -207,7 +208,7 @@ pub const Link = struct {
                     self.close();
                     return;
                 };
-                _ = self.bytes_tx.fetchAdd(2 + ct_len, .monotonic);
+                _ = self.bytes_tx.fetchAdd(@as(u64, 2) + ct_len, .monotonic);
                 off = end;
             }
             batch.clearRetainingCapacity();
@@ -238,7 +239,7 @@ pub const Link = struct {
         self.rx_pos = 2;
         self.rx_len = 2 + real_len;
         self.last_rx.store(clock.monotonicMs(), .monotonic);
-        _ = self.bytes_rx.fetchAdd(2 + len, .monotonic);
+        _ = self.bytes_rx.fetchAdd(@as(u64, 2) + len, .monotonic);
     }
 };
 
@@ -409,6 +410,32 @@ const HandshakeFixture = struct {
         out.* = res.link;
     }
 };
+
+test "a max-size UDP-ish frame survives the record layer" {
+    const gpa = std.testing.allocator;
+    const static = noise.KeyPair.generate();
+    const psk = noise.pskFromSecret("s");
+    const client, const server = try loopbackPair(gpa);
+    var server_link: ?*Link = null;
+    var fx: HandshakeFixture = .{ .static = static, .psk = psk, .gpa = gpa };
+    const t = try std.Thread.spawn(.{}, HandshakeFixture.serve, .{ &fx, server.stream, &server_link });
+
+    const res = try clientHandshake(gpa, client.stream, static.public_key, psk, "hello=1\n");
+    t.join();
+    defer res.link.destroy();
+    defer if (server_link) |l| l.destroy();
+    try std.testing.expect(server_link != null);
+
+    // Build a payload at the IPv4 UDP max: proto.max_payload = 65507.
+    const big = try gpa.alloc(u8, proto.max_payload);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i);
+    try res.link.send(.data, 0xdeadbeef, big);
+    const frame = try server_link.?.recvFrame();
+    try std.testing.expectEqual(proto.FrameType.data, frame.type);
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), frame.id);
+    try std.testing.expectEqualSlices(u8, big, frame.payload);
+}
 
 test "ZNL6 handshake round trip and record padding" {
     const gpa = std.testing.allocator;

@@ -21,7 +21,9 @@ pub const link_dead_after_ms = 30_000;
 /// Dial timeout used when a connect request does not carry one.
 pub const default_dial_timeout_ms: u16 = 3000;
 pub const header_len = 8;
-pub const max_payload = 16 * 1024;
+/// Max bytes carried in a single frame's payload. Set to the IPv4 UDP max
+/// datagram size, so a 65-507 B UDP packet fits in one `data` frame.
+pub const max_payload = 65_507;
 /// Per-flow, per-direction flow-control window for TCP flows.
 pub const initial_window: u32 = 256 * 1024;
 /// 240.0.0.0/4 on the proxy side is mapped to the agent's own 127.0.0.1.
