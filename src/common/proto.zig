@@ -8,8 +8,11 @@
 //! `agent_id_bit` set (connections accepted by its listeners).
 const std = @import("std");
 
-/// Bump the digit whenever the handshake or framing changes incompatibly.
-pub const magic = "ZNL5";
+/// Mixed into the Noise prologue so a wrong version fails authentication, but
+/// never sent on the wire — the handshake looks like random bytes from the
+/// first packet. Bump the digit whenever the handshake or framing changes
+/// incompatibly.
+pub const prologue = "zunnel-znl6";
 pub const default_port: u16 = 11601;
 /// Both ends send a ping this often...
 pub const heartbeat_interval_ms = 10_000;

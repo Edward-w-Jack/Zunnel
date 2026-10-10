@@ -14,9 +14,7 @@ const proto = common.proto;
 pub const Config = struct {
     host: []const u8,
     port: u16,
-    /// null with `insecure` = accept any proxy key.
-    pubkey: ?[32]u8,
-    insecure: bool,
+    pubkey: [32]u8,
     secret: []const u8,
     retry: bool,
     /// Absolute deadline (Unix ms) after which the agent stops for good.
@@ -33,7 +31,6 @@ pub const Layer = struct {
     expire: ?[]const u8 = null,
     id: ?[]const u8 = null,
     retry: ?bool = null,
-    insecure: ?bool = null,
 };
 
 pub const Error = error{
@@ -53,10 +50,8 @@ fn first(comptime field: []const u8, layers: []const Layer) @FieldType(Layer, fi
 pub fn resolve(layers: []const Layer, now_ms: i64) Error!Config {
     const connect = first("connect", layers) orelse return error.MissingConnect;
     const host, const port = try parseConnect(connect);
-    const insecure = first("insecure", layers) orelse false;
-    const pubkey: ?[32]u8 = if (first("pubkey", layers)) |k|
-        keys.decode(k) catch return error.InvalidPubkey
-    else if (insecure) null else return error.MissingPubkey;
+    const pubkey_text = first("pubkey", layers) orelse return error.MissingPubkey;
+    const pubkey = keys.decode(pubkey_text) catch return error.InvalidPubkey;
     const expire_at_ms: ?i64 = if (first("expire", layers)) |e|
         parseExpire(e, now_ms) catch return error.InvalidExpire
     else
@@ -65,7 +60,6 @@ pub fn resolve(layers: []const Layer, now_ms: i64) Error!Config {
         .host = host,
         .port = port,
         .pubkey = pubkey,
-        .insecure = insecure,
         .secret = first("secret", layers) orelse "",
         .retry = first("retry", layers) orelse false,
         .expire_at_ms = expire_at_ms,
@@ -147,10 +141,9 @@ test "precedence: args > env > baked" {
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expectEqualStrings("from-args", cfg.secret);
     try std.testing.expect(cfg.retry);
-    try std.testing.expect(cfg.pubkey != null);
     try std.testing.expectError(error.MissingConnect, resolve(&.{.{}}, 0));
     try std.testing.expectError(error.MissingPubkey, resolve(&.{.{ .connect = "h:1" }}, 0));
-    _ = try resolve(&.{.{ .connect = "h:1", .insecure = true }}, 0);
+    try std.testing.expectError(error.InvalidPubkey, resolve(&.{.{ .connect = "h:1", .pubkey = "nope" }}, 0));
 }
 
 test "expire parsing" {

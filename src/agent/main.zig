@@ -28,11 +28,10 @@ fn logFn(
 }
 
 const usage =
-    \\usage: zunnel-agent -connect <host:port> (-pubkey <key> | -insecure) [options]
+    \\usage: zunnel-agent -connect <host:port> -pubkey <key> [options]
     \\
     \\  -connect <host:port>  proxy address                       (env ZUNNEL_CONNECT)
-    \\  -pubkey <key>         expected proxy public key (base64)  (env ZUNNEL_PUBKEY)
-    \\  -insecure             accept any proxy key (prints the fingerprint)
+    \\  -pubkey <key>         proxy public key (base64)           (env ZUNNEL_PUBKEY)
     \\  -secret <secret>      shared secret printed by the proxy  (env ZUNNEL_SECRET)
     \\  -retry                reconnect forever when the connection drops
     \\  -expire <when>        stop for good at a UTC time (2026-10-20T18:00Z)
@@ -74,8 +73,6 @@ fn argLayer(args: []const [:0]u8) config.Layer {
             l.expire = value;
         } else if (std.mem.eql(u8, a, "id")) {
             l.id = value;
-        } else if (std.mem.eql(u8, a, "insecure")) {
-            l.insecure = true;
         } else if (std.mem.eql(u8, a, "retry")) {
             l.retry = true;
         } else if (std.mem.eql(u8, a, "q")) {
@@ -126,7 +123,7 @@ pub fn main() !void {
     const cfg = config.resolve(&layers, std.time.milliTimestamp()) catch |err| switch (err) {
         error.MissingConnect => fatal("{s}", .{usage}),
         error.InvalidConnect => fatal("-connect expects host:port", .{}),
-        error.MissingPubkey => fatal("either -pubkey or -insecure is required", .{}),
+        error.MissingPubkey => fatal("-pubkey is required", .{}),
         error.InvalidPubkey => fatal("invalid -pubkey", .{}),
         error.InvalidExpire => fatal("invalid -expire (use e.g. 2026-10-20T18:00Z, 90m, 72h or 7d)", .{}),
     };
@@ -139,8 +136,7 @@ pub fn main() !void {
             if (!agent.quiet) std.debug.print("agent expired\n", .{});
             std.process.exit(0);
         },
-        .key_mismatch => fatal("proxy public key does not match -pubkey", .{}),
-        .protocol_mismatch => fatal("proxy speaks a different zunnel protocol version; use matching builds", .{}),
+        .key_mismatch => fatal("handshake rejected: wrong -pubkey, -secret, or mismatched zunnel versions", .{}),
     }
 }
 

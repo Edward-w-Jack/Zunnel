@@ -8,7 +8,6 @@ const identity = @import("identity.zig");
 const Config = @import("config.zig").Config;
 
 const proto = common.proto;
-const keys = common.keys;
 const relay = common.relay;
 const Link = common.Link;
 const Listener = @import("listener.zig").Listener;
@@ -29,10 +28,6 @@ pub const RunResult = enum {
     killed,
     /// The `expire` deadline passed.
     expired,
-    /// The proxy's public key did not match the configured one.
-    key_mismatch,
-    /// The proxy speaks another protocol version.
-    protocol_mismatch,
     /// Not retrying, and the connection ended or could not be made.
     disconnected,
 };
@@ -57,9 +52,7 @@ pub fn run(gpa: Allocator, cfg: Config, stop: *std.atomic.Value(bool)) RunResult
                 .stopped => return .stopped,
             }
         } else |err| switch (err) {
-            error.KeyMismatch => return .key_mismatch,
-            error.ProtocolMismatch => return .protocol_mismatch,
-            error.AuthenticationFailed, error.EndOfStream => log.err("handshake rejected: wrong secret, or mismatched zunnel versions", .{}),
+            error.AuthenticationFailed, error.EndOfStream => log.err("handshake rejected: wrong -pubkey, -secret, or mismatched zunnel versions", .{}),
             else => log.err("session failed: {s}", .{@errorName(err)}),
         }
         if (!cfg.retry) return .disconnected;
@@ -144,7 +137,6 @@ fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop:
         transport.close();
         return err;
     };
-    if (cfg.pubkey == null) log.warn("insecure mode: proxy key is {s}", .{&keys.encode(res.server_key)});
     log.info("connected, tunnel is up", .{});
 
     var session: Session = .{ .gpa = gpa, .link = res.link, .table = .init(gpa, res.link) };
@@ -349,7 +341,6 @@ test "run ends cleanly when the proxy kills the agent or the embedder stops it" 
         .host = "127.0.0.1",
         .port = listener.listen_address.getPort(),
         .pubkey = key.public_key,
-        .insecure = false,
         .secret = "s3cret",
         .retry = false,
         .expire_at_ms = null,
