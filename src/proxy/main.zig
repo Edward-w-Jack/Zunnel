@@ -969,4 +969,5 @@ test {
     _ = @import("lineedit.zig");
     _ = @import("tunnel.zig");
     _ = @import("tls.zig");
+    _ = @import("reassemble.zig");
 }

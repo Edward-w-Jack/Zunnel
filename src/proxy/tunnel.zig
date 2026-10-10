@@ -18,6 +18,7 @@ const common = @import("common");
 const lwip = @import("lwip.zig");
 const netstack = @import("netstack.zig");
 const packet = @import("packet.zig");
+const reassemble = @import("reassemble.zig");
 const tun = @import("tun.zig");
 const Session = @import("server.zig").Session;
 
@@ -204,6 +205,7 @@ pub const Tunnel = struct {
     by_tuple: std.AutoHashMapUnmanaged(Tuple, *Flow) = .empty,
     icmp: std.AutoHashMapUnmanaged(u32, PendingIcmp) = .empty,
     recent: std.AutoHashMapUnmanaged(Tuple, Recent) = .empty,
+    reassembly: reassemble.Table = undefined,
     /// TCP dials in flight; SYNs beyond `max_dials` wait in `dial_queue`.
     dialing: u32 = 0,
     dial_queue: std.ArrayList(u32) = .empty,
@@ -223,6 +225,7 @@ pub const Tunnel = struct {
             .index = index,
             .dev = try tun.Tun.open(gpa, if_name, index),
             .localhost_net = localhost_net,
+            .reassembly = reassemble.Table.init(gpa),
         };
         errdefer self.dev.close();
 
@@ -289,6 +292,7 @@ pub const Tunnel = struct {
             while (it.next()) |p| self.gpa.free(p.request);
             self.icmp.deinit(self.gpa);
             self.recent.deinit(self.gpa);
+            self.reassembly.deinit();
             self.dial_queue.deinit(self.gpa);
             self.flows.deinit(self.gpa);
             self.by_tuple.deinit(self.gpa);
@@ -463,6 +467,8 @@ pub const Tunnel = struct {
         var rit = self.recent.iterator();
         while (rit.next()) |e| if (now > e.value_ptr.expires) expired_recent.append(self.gpa, e.key_ptr.*) catch break;
         for (expired_recent.items) |t| _ = self.recent.remove(t);
+
+        self.reassembly.sweep(now);
     }
 
     fn remember(self: *Tunnel, t: Tuple, verdict: Verdict) void {
@@ -474,37 +480,42 @@ pub const Tunnel = struct {
     // ------------------------------------------------------- packet input
 
     fn onPacket(self: *Tunnel, pkt: []const u8) void {
-        const ip = packet.parseIp4(pkt) orelse return;
+        // Reassemble IPv4 fragments before parsing. parseIp4 rejects
+        // fragments; parseIp4Header lets them through so we can offer them
+        // to the reassembly table. The returned slice (owned by the table)
+        // stays valid for the lifetime of this call.
+        const whole = self.reassembly.offer(pkt, clock.monotonicMs()) orelse return;
+        const ip = packet.parseIp4(whole) orelse return;
         switch (ip.proto) {
             packet.proto_tcp => {
                 const seg = packet.parseTcp(ip.payload) orelse return;
                 const is_syn = seg.flags & (packet.tcp_syn | packet.tcp_ack | packet.tcp_rst) == packet.tcp_syn;
                 const t: Tuple = .{ .proto = packet.proto_tcp, .src = ip.src, .sport = seg.sport, .dst = ip.dst, .dport = seg.dport };
                 if (self.by_tuple.get(t)) |flow| {
-                    if (is_syn and flow.state != .open) return self.synAgain(flow, seg.seq, pkt);
+                    if (is_syn and flow.state != .open) return self.synAgain(flow, seg.seq, whole);
                     // Decide before feeding: on this RST lwIP frees its half-open
                     // pcb. The flow has no lwIP callbacks yet, so feeding cannot free it.
                     const reset_before_accept = isResetBeforeAccept(flow, seg);
-                    self.feed(pkt);
+                    self.feed(whole);
                     if (reset_before_accept) self.dropFlow(flow, "client reset before the handshake completed");
                     return;
                 }
                 if (self.recent.get(t)) |r| {
                     if (r.verdict == .closing) {
-                        if (!is_syn) return self.feed(pkt); // late FIN/ACK for lwIP's lingering pcb
+                        if (!is_syn) return self.feed(whole); // late FIN/ACK for lwIP's lingering pcb
                         _ = self.recent.remove(t); // port reused: a new connection
                     } else if (is_syn) {
                         // Retransmitted SYN after a failed dial: same answer, no new dial.
-                        return self.answerFailure(t, seg.seq, r.verdict, pkt);
+                        return self.answerFailure(t, seg.seq, r.verdict, whole);
                     }
                 }
-                if (is_syn) return self.newTcpFlow(t, seg.seq, pkt);
+                if (is_syn) return self.newTcpFlow(t, seg.seq, whole);
                 // Stray segment for a connection that never existed: a VPN would
                 // deliver it to a host that may not exist, so stay silent rather
                 // than letting lwIP answer with a RST (which makes every IP look up).
             },
             packet.proto_udp => self.onUdp(ip),
-            packet.proto_icmp => self.onIcmp(ip, pkt),
+            packet.proto_icmp => self.onIcmp(ip, whole),
             else => {},
         }
     }

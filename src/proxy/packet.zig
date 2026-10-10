@@ -35,6 +35,51 @@ pub fn parseIp4(pkt: []const u8) ?Ip4 {
     };
 }
 
+/// Header slice of an IPv4 packet, with fragment info -- for the reassembly
+/// path, which parses even fragmented packets.
+pub const Ip4Header = struct {
+    src: [4]u8,
+    dst: [4]u8,
+    proto: u8,
+    ip_id: u16,
+    /// Header bytes (ihl*4). Aliases `pkt`.
+    header: []const u8,
+    /// Payload bytes (total - ihl*4). Aliases `pkt`.
+    payload: []const u8,
+    /// Payload offset in the reassembled packet, in bytes. Always a multiple
+    /// of 8 unless MF=0.
+    frag_offset: u16,
+    /// True if more fragments follow this one.
+    more_fragments: bool,
+};
+
+pub fn parseIp4Header(pkt: []const u8) ?Ip4Header {
+    if (pkt.len < 20 or pkt[0] >> 4 != 4) return null;
+    const ihl = @as(usize, pkt[0] & 0x0f) * 4;
+    const total = std.mem.readInt(u16, pkt[2..4], .big);
+    if (ihl < 20 or total < ihl or total > pkt.len) return null;
+    const ip_id = std.mem.readInt(u16, pkt[4..6], .big);
+    const frag = std.mem.readInt(u16, pkt[6..8], .big);
+    const mf = frag & 0x2000 != 0;
+    const offset_blocks = frag & 0x1fff;
+    return .{
+        .src = pkt[12..16].*,
+        .dst = pkt[16..20].*,
+        .proto = pkt[9],
+        .ip_id = ip_id,
+        .header = pkt[0..ihl],
+        .payload = pkt[ihl..total],
+        .frag_offset = @as(u16, offset_blocks) * 8,
+        .more_fragments = mf,
+    };
+}
+
+/// True if the IP packet is a non-head or non-tail fragment of a larger
+/// datagram (MF=1 or offset > 0).
+pub fn ip4IsFragment(hdr: Ip4Header) bool {
+    return hdr.more_fragments or hdr.frag_offset != 0;
+}
+
 pub const Tcp = struct {
     sport: u16,
     dport: u16,
