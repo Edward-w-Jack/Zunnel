@@ -236,6 +236,20 @@ test "tcpConnect: refused fast, unroutable times out" {
     try std.testing.expect(clock.monotonicMs() - start < 2000);
 }
 
+/// Puts a socket in non-blocking mode. Reads and writes that would block
+/// return `error.WouldBlock` instead of waiting.
+pub fn setNonblocking(h: Handle) !void {
+    if (is_windows) {
+        var mode: u32 = 1;
+        if (ws2.ioctlsocket(h, ws2.FIONBIO, &mode) == ws2.SOCKET_ERROR) return error.SetNonblockingFailed;
+        return;
+    }
+    const flags = posix.fcntl(h, posix.F.GETFL, 0) catch return error.SetNonblockingFailed;
+    var o: posix.O = @bitCast(@as(std.meta.Int(.unsigned, @bitSizeOf(posix.O)), @truncate(flags)));
+    o.NONBLOCK = true;
+    _ = posix.fcntl(h, posix.F.SETFL, @as(std.meta.Int(.unsigned, @bitSizeOf(posix.O)), @bitCast(o))) catch return error.SetNonblockingFailed;
+}
+
 pub fn setKeepAlive(h: Handle) void {
     const one: i32 = 1;
     if (is_windows) {
