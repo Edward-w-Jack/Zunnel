@@ -148,6 +148,50 @@ fn writeIp4Header(buf: []u8, src: [4]u8, dst: [4]u8, proto: u8, total: usize) vo
     std.mem.writeInt(u16, buf[10..12], fold(sum16(buf[0..20], 0)), .big);
 }
 
+/// Walks an IPv4 packet, yielding fragments that fit within `mtu`. The
+/// original packet must be a single, non-fragmented datagram. Fragments
+/// share the original packet's `ip_id` (so the receiver reassembles them
+/// as one), each payload segment is a multiple of 8 bytes except the last,
+/// and the IP header is cloned from the input for each fragment.
+pub const FragIter = struct {
+    pkt: []const u8,
+    ihl: usize,
+    frag_payload: usize,
+    offset: usize,
+
+    pub fn next(self: *FragIter, out: []u8) ?[]u8 {
+        const payload = self.pkt[self.ihl..];
+        if (self.offset >= payload.len) return null;
+        const take = @min(self.frag_payload, payload.len - self.offset);
+        const more = self.offset + take < payload.len;
+        const total: u16 = @intCast(self.ihl + take);
+        if (out.len < total) return null;
+        @memcpy(out[0..self.ihl], self.pkt[0..self.ihl]);
+        std.mem.writeInt(u16, out[2..4], total, .big);
+        const mf_bit: u16 = if (more) 0x2000 else 0;
+        std.mem.writeInt(u16, out[6..8], mf_bit | @as(u16, @intCast(self.offset / 8)), .big);
+        std.mem.writeInt(u16, out[10..12], 0, .big);
+        std.mem.writeInt(u16, out[10..12], fold(sum16(out[0..self.ihl], 0)), .big);
+        @memcpy(out[self.ihl..][0..take], payload[self.offset..][0..take]);
+        self.offset += take;
+        return out[0..total];
+    }
+};
+
+pub const FragError = error{ InvalidPacket, MtuTooSmall };
+
+/// Starts a FragIter over `pkt` with `mtu` bytes per fragment. Returns an
+/// error for malformed input, or if the MTU can't fit a header plus one
+/// 8-byte block.
+pub fn fragmentIp4(pkt: []const u8, mtu: usize) FragError!FragIter {
+    if (pkt.len < 20 or pkt[0] >> 4 != 4) return error.InvalidPacket;
+    const ihl = @as(usize, pkt[0] & 0x0f) * 4;
+    if (ihl < 20 or ihl > pkt.len) return error.InvalidPacket;
+    if (mtu < ihl + 8) return error.MtuTooSmall;
+    const frag_payload = (mtu - ihl) & ~@as(usize, 7); // round down to 8
+    return .{ .pkt = pkt, .ihl = ihl, .frag_payload = frag_payload, .offset = 0 };
+}
+
 /// Builds an IPv4/UDP packet into `buf`. Returns null if it does not fit.
 pub fn buildUdp4(buf: []u8, src: [4]u8, sport: u16, dst: [4]u8, dport: u16, data: []const u8) ?[]u8 {
     const total = 20 + 8 + data.len;
@@ -271,6 +315,75 @@ test "udp round trip and checksums" {
     const udp = parseUdp(ip.payload).?;
     try std.testing.expectEqual(@as(u16, 53), udp.sport);
     try std.testing.expectEqualStrings("hi", udp.data);
+}
+
+test "fragmentIp4 splits a 50 KiB packet at a 1500 MTU" {
+    const gpa = std.testing.allocator;
+    const payload_len = 50_000;
+    const payload = try gpa.alloc(u8, payload_len);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i);
+
+    const pkt_buf = try gpa.alloc(u8, 20 + 8 + payload_len);
+    defer gpa.free(pkt_buf);
+    const pkt = buildUdp4(pkt_buf, .{ 10, 0, 0, 1 }, 53, .{ 10, 0, 0, 2 }, 40000, payload).?;
+    // Set an ip_id so reassembly groups the fragments.
+    std.mem.writeInt(u16, pkt_buf[4..6], 0x1234, .big);
+    std.mem.writeInt(u16, pkt_buf[10..12], 0, .big);
+    std.mem.writeInt(u16, pkt_buf[10..12], fold(sum16(pkt_buf[0..20], 0)), .big);
+
+    var it = try fragmentIp4(pkt, 1500);
+    var frag_buf: [1500]u8 = undefined;
+    var count: usize = 0;
+    var total_payload: usize = 0;
+    while (it.next(&frag_buf)) |frag| : (count += 1) {
+        try std.testing.expect(frag.len <= 1500);
+        try std.testing.expectEqual(@as(u16, 0), fold(sum16(frag[0..20], 0)));
+        const hdr = parseIp4Header(frag).?;
+        try std.testing.expectEqual(@as(u16, 0x1234), hdr.ip_id);
+        total_payload += hdr.payload.len;
+        // All but the last fragment have MF=1 and a 1480-byte payload.
+        if (hdr.more_fragments) try std.testing.expectEqual(@as(usize, 1480), hdr.payload.len);
+    }
+    try std.testing.expectEqual(pkt.len - 20, total_payload);
+    try std.testing.expectEqual(@as(usize, (50_008 + 1479) / 1480), count);
+}
+
+test "fragmentIp4 output reassembles back to the input" {
+    const reassemble = @import("reassemble.zig");
+    const gpa = std.testing.allocator;
+    const payload_len = 40_000;
+    const payload = try gpa.alloc(u8, payload_len);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i);
+
+    const pkt_buf = try gpa.alloc(u8, 20 + 8 + payload_len);
+    defer gpa.free(pkt_buf);
+    const pkt = buildUdp4(pkt_buf, .{ 10, 0, 0, 1 }, 53, .{ 10, 0, 0, 2 }, 40000, payload).?;
+    std.mem.writeInt(u16, pkt_buf[4..6], 0xbeef, .big);
+    std.mem.writeInt(u16, pkt_buf[10..12], 0, .big);
+    std.mem.writeInt(u16, pkt_buf[10..12], fold(sum16(pkt_buf[0..20], 0)), .big);
+
+    var it = try fragmentIp4(pkt, 1500);
+    var frag_buf: [1500]u8 = undefined;
+    var table: reassemble.Table = .init(gpa);
+    defer table.deinit();
+    while (it.next(&frag_buf)) |frag| {
+        if (table.offer(frag, 1_000)) |done| {
+            const got = parseIp4(done).?;
+            try std.testing.expectEqualSlices(u8, pkt[20..], done[20..]);
+            try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, &got.src);
+            return;
+        }
+    }
+    return error.ReassemblyNeverCompleted;
+}
+
+test "fragmentIp4 rejects tiny MTUs and malformed input" {
+    var buf: [40]u8 = undefined;
+    const pkt = buildUdp4(&buf, .{ 1, 2, 3, 4 }, 10, .{ 5, 6, 7, 8 }, 20, "hi").?;
+    try std.testing.expectError(error.MtuTooSmall, fragmentIp4(pkt, 27));
+    try std.testing.expectError(error.InvalidPacket, fragmentIp4(pkt[0..3], 1500));
 }
 
 test "fuzz packet parsing and replies" {

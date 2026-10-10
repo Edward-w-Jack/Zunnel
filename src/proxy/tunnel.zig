@@ -679,7 +679,20 @@ pub const Tunnel = struct {
 
     fn replyIcmp(self: *Tunnel, req: packet.Ip4) void {
         var buf: [65536]u8 = undefined;
-        if (packet.buildIcmpEchoReply4(&buf, req)) |reply| self.dev.write(reply);
+        if (packet.buildIcmpEchoReply4(&buf, req)) |reply| self.writeIp(reply);
+    }
+
+    /// Writes an IPv4 packet to the TUN, fragmenting if it exceeds the MTU.
+    /// Fragments share the input packet's ip_id; the receiver reassembles.
+    fn writeIp(self: *Tunnel, pkt: []const u8) void {
+        if (pkt.len <= tun.mtu) return self.dev.write(pkt);
+        var it = packet.fragmentIp4(pkt, tun.mtu) catch {
+            // Give the oversize packet to the TUN anyway and let the OS drop
+            // or truncate it -- better than silence.
+            return self.dev.write(pkt);
+        };
+        var frag_buf: [tun.mtu]u8 = undefined;
+        while (it.next(&frag_buf)) |frag| self.dev.write(frag);
     }
 
     // ------------------------------------------------------- agent frames
@@ -764,10 +777,10 @@ pub const Tunnel = struct {
             .connect_fail, .reset => self.destroyFlow(flow),
             .data => {
                 flow.last_active = clock.monotonicMs();
-                var buf: [tun.mtu + 64 + proto.max_payload]u8 = undefined;
+                var buf: [20 + 8 + proto.max_payload]u8 = undefined;
                 const t = flow.tuple;
                 const pkt = packet.buildUdp4(&buf, t.dst, t.dport, t.src, t.sport, frame.payload) orelse return;
-                self.dev.write(pkt);
+                self.writeIp(pkt);
                 flow.bytes_down += frame.payload.len;
                 self.stats.bytes_down += frame.payload.len;
             },
