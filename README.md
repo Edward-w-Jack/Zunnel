@@ -240,6 +240,20 @@ zig build -Drelease -Dtarget=x86_64-windows --prefix zig-out/op1 \
   -Dagent-connect=proxy.example.com:11601 -Dagent-pubkey=<key> -Dagent-secret=<secret> -Dagent-expire=7d
 ```
 
+Two extra build options help deploy an unattended Windows agent:
+
+- `-Dagent-windowed=true` builds the exe with the Windows GUI subsystem, so no console window
+  appears when the agent runs. Log output is silenced; use `-v` from a terminal to see it.
+- `-Dagent-service=true` adds `install-service` and `uninstall-service` subcommands and lets
+  the Service Control Manager run the exe. Install from an elevated shell:
+  ```
+  zunnel-agent.exe install-service        # register auto-start LocalSystem service
+  sc start ZunnelAgent                     # or wait for the next reboot
+  zunnel-agent.exe uninstall-service       # remove it
+  ```
+  The service uses the baked-in config exclusively (SCM forwards no arguments), so build the
+  agent with `-Dagent-connect`/`-Dagent-pubkey`/`-Dagent-secret` before installing.
+
 ### Windows notes
 
 The proxy needs Administrator rights and `wintun.dll` (from https://www.wintun.net) next to
@@ -317,6 +331,8 @@ translates the result back into packets:
 - [x] P2 transports (part 1): TLS 1.3 transport (mbedTLS on the proxy, `std.crypto.tls.Client`
   on the agent, self-signed cert on first run, `-tls-verify` for a real cert check), and the
   ZNL6 wire with no cleartext magic and record padding
+- [x] P2 Windows deployment: `-Dagent-windowed` builds a GUI-subsystem agent (no console window),
+  `-Dagent-service` adds `install-service`/`uninstall-service` subcommands and SCM dispatch
 
 ## Roadmap
 
@@ -337,8 +353,9 @@ translates the result back into packets:
 ### P2: transports and evasion
 - [x] TLS 1.3 transport on top of the Noise link (default on; `-no-tls` keeps raw TCP).
 - [x] Less distinctive handshake: no cleartext magic, record padding to fixed-size buckets.
+- [x] Windows agent built without a console window (`-Dagent-windowed`); optional run-as-service
+  (`-Dagent-service` with `install-service`/`uninstall-service`).
 - [ ] WebSocket transport and HTTP CONNECT proxy traversal (with auto-detection on Windows).
-- [ ] Windows agent built without a console window; optional run-as-service.
 
 ### P3: protocol coverage and scale
 - [ ] IPv6 (lwIP dual stack, IPv6 routes on the TUN).
