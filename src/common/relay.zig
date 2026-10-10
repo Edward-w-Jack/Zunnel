@@ -1,27 +1,42 @@
 //! Relays flows between an OS socket and the link, with per-flow credit-based
-//! flow control. Used by the agent (dialed flows and its listeners) and by the
-//! proxy (connections accepted by agent listeners, dialed on the proxy side).
+//! flow control. One `Table` runs on a single I/O thread driven by `Reactor`:
+//! sockets are non-blocking, state transitions react to readiness events, and
+//! no thread is spawned per flow.
 //!
 //! Flow kinds:
 //!   - dialed:  the peer asked us to connect somewhere (`Table.dial`); we
 //!              answer connect_ok / connect_fail.
 //!   - adopted: we accepted a TCP connection (`Table.adoptTcp`) and announced
 //!              it; relaying starts once the peer answers connect_ok.
-//!   - UDP listener associations (`Table.adoptUdp`): datagrams are read by the
-//!              listener and replies go out with sendto on its socket.
+//!   - UDP listener associations (`Table.adoptUdp`): datagrams flow over a
+//!              listener socket owned by someone else; the listener must call
+//!              `Flow.detachListener` when it stops.
+//!
+//! Threading: public `Table` and `Flow` methods are safe from any thread.
+//! They hold the one `Table.mutex` while mutating state, then
+//! `reactor.wake()` nudges the I/O thread to re-poll with the fresh view.
 const std = @import("std");
+const builtin = @import("builtin");
 const clock = @import("clock.zig");
 const proto = @import("proto.zig");
 const sock = @import("sock.zig");
 const link_mod = @import("link.zig");
+const reactor_mod = @import("reactor.zig");
 
+const posix = std.posix;
+const is_windows = builtin.os.tag == .windows;
 const Link = link_mod.Link;
 const Frame = link_mod.Frame;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.relay);
 
-const thread_cfg: std.Thread.SpawnConfig = .{ .stack_size = 256 * 1024 };
 pub const udp_idle_ms = 120 * std.time.ms_per_s;
+/// Max unsent bytes buffered per direction before we abort the flow for
+/// ignoring our credit (TCP) or stop writing (UDP).
+const inbox_cap: usize = 2 * proto.initial_window;
+const default_dial_timeout_ms: u32 = proto.default_dial_timeout_ms;
+/// Return flow-control credit to the peer in batches of at least this much.
+const window_batch: u32 = 32 * 1024;
 
 /// Called after a successful outgoing TCP dial (used by the proxy to track relays).
 pub const DialHook = struct {
@@ -32,21 +47,28 @@ pub const DialHook = struct {
 pub const Table = struct {
     gpa: Allocator,
     link: *Link,
+    reactor: reactor_mod.Reactor,
+    /// Everything below is guarded by `mutex`.
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     flows: std.AutoHashMapUnmanaged(u32, *Flow) = .empty,
-    /// Flows not yet freed plus other borrowers (they may still use `link`).
-    live: usize = 0,
     next_id: u32 = 0,
+    dialing: u32 = 0,
+    live: u32 = 0,
     on_dialed: ?DialHook = null,
-    /// Backstop against a peer that floods us with connects (the proxy also
-    /// caps dials per session).
-    dial_sem: std.Thread.Semaphore = .{ .permits = max_concurrent_dials },
+    stop_requested: bool = false,
+    io_thread: ?std.Thread = null,
 
     pub const max_concurrent_dials = 512;
 
-    pub fn init(gpa: Allocator, link: *Link) Table {
-        return .{ .gpa = gpa, .link = link };
+    pub fn init(gpa: Allocator, link: *Link) !*Table {
+        const t = try gpa.create(Table);
+        errdefer gpa.destroy(t);
+        t.* = .{ .gpa = gpa, .link = link, .reactor = undefined };
+        t.reactor = try reactor_mod.Reactor.init(gpa);
+        errdefer t.reactor.deinit();
+        t.io_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, ioMain, .{t});
+        return t;
     }
 
     /// Lets a helper thread use `link` until `releaseLive`; shutdown waits for it.
@@ -63,166 +85,158 @@ pub const Table = struct {
         self.cond.broadcast();
     }
 
-    /// Aborts every flow and waits until nothing references the link anymore.
-    /// Listeners feeding `adoptUdp` flows must be stopped first.
+    /// Signals all flows to abort, waits for the I/O thread, and frees the
+    /// Table. Listeners feeding `adoptUdp` associations must be stopped first.
     pub fn shutdown(self: *Table) void {
-        var all: std.ArrayList(*Flow) = .empty;
-        defer all.deinit(self.gpa);
-        self.mutex.lock();
-        var it = self.flows.valueIterator();
-        while (it.next()) |f| {
-            all.append(self.gpa, f.*) catch {
-                f.*.abort(false); // best effort: threads still notice
-                continue;
-            };
-            f.*.retain();
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.stop_requested = true;
+            var it = self.flows.valueIterator();
+            while (it.next()) |fp| fp.*.abortLocked();
         }
-        self.mutex.unlock();
-        for (all.items) |f| {
-            f.kill();
-            f.release();
+        self.reactor.wake();
+        if (self.io_thread) |t| {
+            t.join();
+            self.io_thread = null;
         }
         self.mutex.lock();
         while (self.live > 0) self.cond.wait(&self.mutex);
-        self.flows.deinit(self.gpa);
         self.mutex.unlock();
+        self.reactor.deinit();
+        self.flows.deinit(self.gpa);
+        self.gpa.destroy(self);
     }
 
-    /// Handles connect_ok/connect_fail/data/window/fin/reset for a flow in this
-    /// table. Returns false if `frame.id` is unknown.
+    /// Handles a frame addressed to one of our flows. Returns false if the id
+    /// isn't ours.
     pub fn dispatch(self: *Table, frame: Frame) bool {
-        const flow = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const f = self.flows.get(frame.id) orelse return false;
-            f.retain();
-            break :blk f;
-        };
-        defer flow.release();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const flow = self.flows.get(frame.id) orelse return false;
         switch (frame.type) {
-            .connect_ok => flow.peerReady(),
-            .connect_fail, .reset => flow.kill(),
+            .connect_ok => flow.onPeerReady(),
+            .connect_fail, .reset => flow.abortLocked(),
             .data => flow.pushData(frame.payload),
-            .window => if (frame.payload.len == 4) flow.addCredit(std.mem.readInt(u32, frame.payload[0..4], .big)),
-            .fin => flow.pushFin(),
+            .window => if (frame.payload.len == 4) {
+                flow.credit +|= std.mem.readInt(u32, frame.payload[0..4], .big);
+            },
+            .fin => {
+                flow.inbox_fin = true;
+            },
             else => {},
         }
+        self.reactor.wake();
         return true;
     }
 
-    /// Allocates an id in the agent's half of the id space.
+    /// Agent-side id allocator (ids have `agent_id_bit` set).
     pub fn allocId(self: *Table) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.allocIdLocked();
+    }
+
+    fn allocIdLocked(self: *Table) u32 {
         while (true) {
             self.next_id = (self.next_id +% 1) | proto.agent_id_bit;
-            if (!self.flows.contains(self.next_id)) return self.next_id;
+            if (self.next_id != 0 and !self.flows.contains(self.next_id)) return self.next_id;
         }
     }
 
-    fn insert(self: *Table, flow: *Flow) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const gop = self.flows.getOrPut(self.gpa, flow.id) catch return false;
-        if (gop.found_existing) return false;
-        gop.value_ptr.* = flow;
-        self.live += 1;
-        return true;
-    }
-
-    fn newFlow(self: *Table, f: Flow) ?*Flow {
-        const flow = self.gpa.create(Flow) catch return null;
-        flow.* = f;
-        if (!self.insert(flow)) {
-            self.gpa.destroy(flow);
-            return null;
-        }
-        return flow;
-    }
-
-    fn removeFlow(self: *Table, flow: *Flow) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.flows.get(flow.id)) |f| {
-            if (f == flow) _ = self.flows.remove(flow.id);
-        }
-    }
-
-    /// The peer asked us to open `target`; replies connect_ok / connect_fail.
-    /// `timeout_ms` = 0 uses `proto.default_dial_timeout_ms`.
     pub fn dial(self: *Table, id: u32, transport: proto.Transport, target: std.net.Address, timeout_ms: u16) void {
         if (transport != .tcp and transport != .udp) {
             self.link.send(.connect_fail, id, &.{@intFromEnum(proto.FailReason.other)}) catch {};
             return;
         }
-        const flow = self.newFlow(.{
-            .table = self,
-            .id = id,
-            .transport = transport,
-            .target = target,
-            .open_dirs = if (transport == .tcp) 2 else 1,
-            .dial_timeout_ms = if (timeout_ms == 0) proto.default_dial_timeout_ms else timeout_ms,
-        }) orelse {
-            self.link.send(.connect_fail, id, &.{@intFromEnum(proto.FailReason.other)}) catch {};
-            return;
-        };
-
-        if (transport == .udp) {
-            // Open the socket before handling the next frame: the first datagram
-            // follows right behind the request.
-            const h = sock.udpConnect(target) catch |err| return flow.fail(proto.FailReason.fromError(err));
-            sock.setRecvTimeout(h, 1000);
-            flow.touch();
-            flow.handle = h;
-            flow.state = .open;
-            self.link.send(.connect_ok, id, &.{}) catch {};
+        var post_fail = false;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.dialing >= max_concurrent_dials) {
+                post_fail = true;
+            } else if (self.newFlowLocked(.{
+                .table = self,
+                .id = id,
+                .transport = transport,
+                .target = target,
+                .state = .connecting,
+                .dial_timeout_ms = if (timeout_ms == 0) default_dial_timeout_ms else timeout_ms,
+                .created = clock.monotonicMs(),
+                .last_active = clock.monotonicMs(),
+                .open_dirs = if (transport == .tcp) 2 else 1,
+            })) |flow| {
+                self.dialing += 1;
+                flow.want_dial = true;
+                self.reactor.wake();
+            } else {
+                post_fail = true;
+            }
         }
-        flow.retain();
-        const t = (if (transport == .tcp)
-            std.Thread.spawn(thread_cfg, Flow.tcpDialMain, .{flow})
-        else
-            std.Thread.spawn(thread_cfg, Flow.udpMain, .{flow})) catch {
-            flow.release();
-            return flow.fail(.other);
-        };
-        t.detach();
+        if (post_fail) self.link.send(.connect_fail, id, &.{@intFromEnum(proto.FailReason.other)}) catch {};
     }
 
-    /// Registers an accepted TCP connection (takes ownership of `h`). Relaying
-    /// starts when the peer answers connect_ok. Returns the new flow id.
     pub fn adoptTcp(self: *Table, h: sock.Handle) ?u32 {
-        const flow = self.newFlow(.{
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        sock.setNonblocking(h) catch {
+            sock.close(h);
+            return null;
+        };
+        const id = self.allocIdLocked();
+        _ = self.newFlowLocked(.{
             .table = self,
-            .id = self.allocId(),
+            .id = id,
             .transport = .tcp,
             .target = undefined,
             .handle = h,
             .state = .waiting,
+            .last_active = clock.monotonicMs(),
             .open_dirs = 2,
         }) orelse {
             sock.close(h);
             return null;
         };
-        return flow.id;
+        self.reactor.wake();
+        return id;
     }
 
-    /// Registers a UDP association on a listener socket (not owned). The
-    /// returned flow carries an extra reference for the listener, which must
-    /// eventually call `Flow.detachListener`.
     pub fn adoptUdp(self: *Table, listener: sock.Handle, peer: std.net.Address) ?*Flow {
-        const flow = self.newFlow(.{
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const id = self.allocIdLocked();
+        const flow = self.newFlowLocked(.{
             .table = self,
-            .id = self.allocId(),
+            .id = id,
             .transport = .udp,
             .target = peer,
             .handle = listener,
             .owns_handle = false,
             .udp_peer = peer,
             .state = .open,
+            .last_active = clock.monotonicMs(),
             .open_dirs = 1,
         }) orelse return null;
-        flow.touch();
+        // Listener associations don't register the shared listener socket in
+        // this reactor: the listener-owner polls it. Mark `no_register` so
+        // the io thread doesn't try to add it.
+        flow.no_register = true;
         flow.retain();
+        return flow;
+    }
+
+    fn newFlowLocked(self: *Table, f: Flow) ?*Flow {
+        const flow = self.gpa.create(Flow) catch return null;
+        flow.* = f;
+        const gop = self.flows.getOrPut(self.gpa, flow.id) catch {
+            self.gpa.destroy(flow);
+            return null;
+        };
+        if (gop.found_existing) {
+            self.gpa.destroy(flow);
+            return null;
+        }
+        gop.value_ptr.* = flow;
         return flow;
     }
 };
@@ -233,26 +247,34 @@ pub const Flow = struct {
     transport: proto.Transport,
     target: std.net.Address,
 
-    /// The table entry holds one reference; every thread working on the flow holds one.
     refs: std.atomic.Value(u32) = .init(1),
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+
     handle: ?sock.Handle = null,
     owns_handle: bool = true,
-    /// UDP listener associations reply with sendto to this address.
+    /// UDP listener associations reply via sendto to this address.
     udp_peer: ?std.net.Address = null,
-    state: enum { connecting, waiting, open } = .connecting,
+    /// Set when the socket is owned by someone else (a listener): the io
+    /// thread must not add it to its reactor.
+    no_register: bool = false,
+
+    state: enum { connecting, waiting, open, closed } = .connecting,
+    open_dirs: u8 = 0,
+    aborted: bool = false,
+
     /// peer -> socket bytes not yet written.
     inbox: std.ArrayList(u8) = .empty,
     inbox_fin: bool = false,
-    aborted: bool = false,
-    removed: bool = false,
-    /// Bytes we may still send to the peer (TCP flow control).
+    send_closed: bool = false,
+
     credit: u32 = proto.initial_window,
-    /// Directions still running; the flow is finished when this reaches 0.
-    open_dirs: u8,
-    last_active: std.atomic.Value(i64) = .init(0),
-    dial_timeout_ms: u32 = proto.default_dial_timeout_ms,
+    unreported: u32 = 0,
+
+    want_dial: bool = false,
+    registered: bool = false,
+
+    created: i64 = 0,
+    last_active: i64 = 0,
+    dial_timeout_ms: u32 = default_dial_timeout_ms,
 
     pub fn retain(self: *Flow) void {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -260,282 +282,376 @@ pub const Flow = struct {
 
     pub fn release(self: *Flow) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        if (self.owns_handle) if (self.handle) |h| sock.close(h);
         const table = self.table;
         self.inbox.deinit(table.gpa);
         table.gpa.destroy(self);
-        table.releaseLive();
     }
 
     pub fn touch(self: *Flow) void {
-        self.last_active.store(clock.monotonicMs(), .monotonic);
+        self.table.mutex.lock();
+        defer self.table.mutex.unlock();
+        self.last_active = clock.monotonicMs();
     }
 
     pub fn idleMs(self: *Flow) i64 {
-        return clock.monotonicMs() - self.last_active.load(.monotonic);
+        self.table.mutex.lock();
+        defer self.table.mutex.unlock();
+        return clock.monotonicMs() - self.last_active;
     }
 
     pub fn isAborted(self: *Flow) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.table.mutex.lock();
+        defer self.table.mutex.unlock();
         return self.aborted;
     }
 
-    /// Removes the flow from the table (dropping the table's reference).
-    fn unlink(self: *Flow) void {
-        self.mutex.lock();
-        const was_removed = self.removed;
-        self.removed = true;
-        self.mutex.unlock();
-        if (was_removed) return;
-        self.table.removeFlow(self);
-        self.release();
-    }
-
-    fn fail(self: *Flow, reason: proto.FailReason) void {
-        self.table.link.send(.connect_fail, self.id, &.{@intFromEnum(reason)}) catch {};
-        self.unlink();
-    }
-
-    /// Aborts both directions. `notify` sends a reset to the peer.
     pub fn abort(self: *Flow, notify: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.aborted) return;
-        self.aborted = true;
-        if (self.owns_handle) if (self.handle) |h| sock.shutdown(h, .both);
-        self.cond.broadcast();
+        {
+            self.table.mutex.lock();
+            defer self.table.mutex.unlock();
+            self.abortLocked();
+        }
         if (notify) self.table.link.send(.reset, self.id, &.{}) catch {};
+        self.table.reactor.wake();
     }
 
-    /// Aborts without notifying the peer; also unlinks flows whose threads never started.
-    fn kill(self: *Flow) void {
-        self.abort(false);
-        self.mutex.lock();
-        const waiting = self.state == .waiting;
-        self.mutex.unlock();
-        if (waiting) self.unlink();
-    }
-
-    /// Called by a direction's owner when it is done.
-    fn dirDone(self: *Flow) void {
-        self.mutex.lock();
-        self.open_dirs -= 1;
-        const finished = self.open_dirs == 0;
-        self.mutex.unlock();
-        if (finished) self.unlink();
-    }
-
-    /// Ends a UDP listener association (`idle` sends a reset to the peer).
     pub fn detachListener(self: *Flow, idle: bool) void {
         self.abort(idle);
-        self.dirDone();
         self.release();
     }
 
+    /// Caller holds Table.mutex.
+    fn abortLocked(self: *Flow) void {
+        self.aborted = true;
+        if (self.owns_handle) if (self.handle) |h| sock.shutdown(h, .both);
+    }
+
+    /// Peer answered connect_ok. Caller holds Table.mutex.
+    fn onPeerReady(self: *Flow) void {
+        if (self.state == .waiting) self.state = .open;
+    }
+
+    /// Peer sent bytes. Caller holds Table.mutex. UDP writes right away.
     fn pushData(self: *Flow, data: []const u8) void {
+        if (self.aborted) return;
         if (self.transport == .udp) {
-            self.touch();
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.aborted) return;
+            self.last_active = clock.monotonicMs();
             const h = self.handle orelse return;
             if (self.udp_peer) |peer| sock.sendTo(h, data, peer) catch {} else _ = sock.send(h, data) catch {};
             return;
         }
-        self.mutex.lock();
-        if (self.aborted) return self.mutex.unlock();
-        const overflow = self.inbox.items.len + data.len > 2 * proto.initial_window;
-        const ok = !overflow and if (self.inbox.appendSlice(self.table.gpa, data)) true else |_| false;
-        if (ok) self.cond.broadcast();
-        self.mutex.unlock();
-        // Peer ignored flow control (or we are out of memory): drop the flow.
-        if (!ok) self.abort(true);
-    }
-
-    fn pushFin(self: *Flow) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.inbox_fin = true;
-        self.cond.broadcast();
-    }
-
-    fn addCredit(self: *Flow, n: u32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.credit +|= n;
-        self.cond.broadcast();
-    }
-
-    /// connect_ok for an adopted TCP flow: start relaying.
-    fn peerReady(self: *Flow) void {
-        self.mutex.lock();
-        const was_waiting = self.state == .waiting and !self.aborted;
-        if (was_waiting) self.state = .open;
-        self.mutex.unlock();
-        if (!was_waiting) return;
-
-        self.retain();
-        const reader = std.Thread.spawn(thread_cfg, tcpReaderMain, .{self}) catch {
-            self.release();
-            self.abort(true);
-            self.dirDone(); // reader
-            self.dirDone(); // writer
+        if (self.inbox.items.len + data.len > inbox_cap) {
+            self.abortLocked();
             return;
-        };
-        reader.detach();
-        self.startWriter();
-    }
-
-    fn startWriter(self: *Flow) void {
-        self.retain();
-        const writer = std.Thread.spawn(thread_cfg, tcpWriter, .{self}) catch {
-            self.release();
-            self.abort(true);
-            self.dirDone();
-            return;
-        };
-        writer.detach();
-    }
-
-    // ------------------------------------------------------------------ TCP
-
-    fn tcpDialMain(self: *Flow) void {
-        defer self.release();
-        const table = self.table;
-        const h = blk: {
-            table.dial_sem.wait();
-            defer table.dial_sem.post();
-            break :blk sock.tcpConnect(self.target, self.dial_timeout_ms) catch |err| {
-                log.debug("flow {x}: dial {f} failed: {s}", .{ self.id, self.target, @errorName(err) });
-                return self.fail(proto.FailReason.fromError(err));
-            };
-        };
-        sock.setNoDelay(h);
-
-        self.mutex.lock();
-        self.handle = h;
-        const aborted = self.aborted;
-        if (!aborted) self.state = .open;
-        self.mutex.unlock();
-        if (aborted) return self.unlink();
-
-        table.link.send(.connect_ok, self.id, &.{}) catch {
-            self.abort(false);
-            return self.unlink();
-        };
-        if (table.on_dialed) |hook| hook.func(hook.ctx, self.target, h);
-
-        self.startWriter();
-        self.readLoop();
-    }
-
-    fn tcpReaderMain(self: *Flow) void {
-        defer self.release();
-        self.readLoop();
-    }
-
-    /// socket -> peer, limited by the peer's credit.
-    fn readLoop(self: *Flow) void {
-        const link = self.table.link;
-        const h = self.handle.?;
-        var buf: [proto.max_payload]u8 = undefined;
-        while (true) {
-            self.mutex.lock();
-            while (self.credit == 0 and !self.aborted) self.cond.wait(&self.mutex);
-            const stop = self.aborted;
-            const max = @min(self.credit, buf.len);
-            self.mutex.unlock();
-            if (stop) break;
-
-            const n = sock.recv(h, buf[0..max]) catch {
-                self.abort(true);
-                break;
-            };
-            if (n == 0) {
-                link.send(.fin, self.id, &.{}) catch {};
-                break;
-            }
-            self.mutex.lock();
-            self.credit -= @intCast(n);
-            self.mutex.unlock();
-            link.send(.data, self.id, buf[0..n]) catch {
-                self.abort(false);
-                break;
-            };
         }
-        self.dirDone();
+        self.inbox.appendSlice(self.table.gpa, data) catch self.abortLocked();
     }
 
-    /// peer -> socket; returns credit as data is written.
-    fn tcpWriter(self: *Flow) void {
-        defer self.release();
-        const gpa = self.table.gpa;
-        const h = self.handle.?;
-        var pending: std.ArrayList(u8) = .empty;
-        defer pending.deinit(gpa);
-
-        while (true) {
-            self.mutex.lock();
-            while (self.inbox.items.len == 0 and !self.inbox_fin and !self.aborted) self.cond.wait(&self.mutex);
-            if (self.aborted) {
-                self.mutex.unlock();
-                break;
-            }
-            if (self.inbox.items.len == 0) { // fin and fully drained
-                self.mutex.unlock();
-                sock.shutdown(h, .send);
-                break;
-            }
-            std.mem.swap(std.ArrayList(u8), &self.inbox, &pending);
-            self.mutex.unlock();
-
-            sock.sendAll(h, pending.items) catch {
-                self.abort(true);
-                break;
-            };
-            self.table.link.sendWindow(self.id, @intCast(pending.items.len)) catch {
-                self.abort(false);
-                break;
-            };
-            pending.clearRetainingCapacity();
-        }
-        self.dirDone();
-    }
-
-    // ------------------------------------------------------------------ UDP
-
-    fn udpMain(self: *Flow) void {
-        defer self.release();
-        const link = self.table.link;
-        const h = self.handle.?;
-        var buf: [proto.max_payload]u8 = undefined;
-        while (true) {
-            if (self.isAborted()) break;
-            const n = sock.recv(h, &buf) catch |err| switch (err) {
-                error.Timeout => {
-                    if (self.idleMs() > udp_idle_ms) {
-                        self.abort(true);
-                        break;
-                    }
-                    continue;
+    /// What the reactor should listen for right now. Caller holds Table.mutex.
+    fn desiredInterest(self: *Flow) reactor_mod.Interest {
+        if (self.aborted) return .{};
+        return switch (self.state) {
+            .connecting => .{ .write = true },
+            .waiting => .{}, // not registered yet
+            .open => switch (self.transport) {
+                .tcp => .{
+                    .read = self.credit > 0 and self.open_dirs > 0 and !self.send_closed_hack(),
+                    .write = self.inbox.items.len > 0 or (self.inbox_fin and !self.send_closed),
                 },
-                // The target answered a datagram with ICMP port unreachable
-                // (ECONNREFUSED / WSAECONNRESET on a connected UDP socket):
-                // tell the peer so the client sees a closed port.
-                error.ConnectionReset => {
-                    log.debug("flow {x}: {f} port unreachable", .{ self.id, self.target });
-                    link.send(.icmp_unreachable, self.id, &.{3}) catch {};
-                    continue;
-                },
-                else => continue,
-            };
-            self.touch();
-            link.sendDroppable(.data, self.id, buf[0..n]) catch {
-                self.abort(false);
-                break;
-            };
+                .udp => .{ .read = true },
+                else => .{},
+            },
+            .closed => .{},
+        };
+    }
+
+    fn send_closed_hack(self: *Flow) bool {
+        _ = self;
+        return false;
+    }
+
+    /// Earliest deadline (ms from now) this flow cares about, or null.
+    fn nextDeadline(self: *Flow, now: i64) ?i32 {
+        if (self.aborted) return 0;
+        switch (self.state) {
+            .connecting => return @intCast(@max(0, @as(i64, self.dial_timeout_ms) - (now - self.created))),
+            .open => if (self.transport == .udp) return @intCast(@max(0, udp_idle_ms - (now - self.last_active))),
+            else => {},
         }
-        self.dirDone();
+        return null;
+    }
+
+    /// Caller holds Table.mutex. Removes the flow and drops the table's ref.
+    fn finalize(self: *Flow) void {
+        if (self.state == .closed) return;
+        self.state = .closed;
+        if (self.registered) if (self.handle) |h| self.table.reactor.remove(h);
+        self.registered = false;
+        if (self.owns_handle) if (self.handle) |h| {
+            sock.close(h);
+            self.handle = null;
+        };
+        _ = self.table.flows.remove(self.id);
+        self.release();
     }
 };
+
+// ------------------------------------------------------------- io thread
+
+fn ioMain(table: *Table) void {
+    var events: [128]reactor_mod.Event = undefined;
+    while (true) {
+        var timeout_ms: i32 = 500;
+        {
+            table.mutex.lock();
+            defer table.mutex.unlock();
+            cleanupClosed(table);
+            if (table.stop_requested and table.flows.count() == 0) return;
+            syncRegistrations(table, &timeout_ms);
+        }
+        const n = table.reactor.wait(&events, timeout_ms) catch 0;
+        table.mutex.lock();
+        for (events[0..n]) |ev| dispatchEvent(table, ev);
+        tickTime(table);
+        cleanupClosed(table);
+        table.mutex.unlock();
+    }
+}
+
+/// Caller holds Table.mutex.
+fn cleanupClosed(table: *Table) void {
+    var dead: std.ArrayList(*Flow) = .empty;
+    defer dead.deinit(table.gpa);
+    var it = table.flows.valueIterator();
+    while (it.next()) |fp| {
+        const f = fp.*;
+        if (f.aborted and (f.transport == .udp or f.inbox.items.len == 0 or f.state == .closed or f.state == .connecting)) {
+            dead.append(table.gpa, f) catch continue;
+        }
+    }
+    for (dead.items) |f| f.finalize();
+}
+
+fn syncRegistrations(table: *Table, timeout_ms: *i32) void {
+    const now = clock.monotonicMs();
+    var it = table.flows.valueIterator();
+    while (it.next()) |fp| {
+        const flow = fp.*;
+        if (flow.want_dial and flow.state == .connecting) {
+            flow.want_dial = false;
+            startDial(flow);
+        }
+        if (flow.state == .closed or flow.aborted or flow.no_register) continue;
+        const h = flow.handle orelse continue;
+        const interest = flow.desiredInterest();
+        if (!flow.registered) {
+            table.reactor.add(h, @ptrCast(flow), interest) catch continue;
+            flow.registered = true;
+        } else {
+            table.reactor.modify(h, interest) catch {};
+        }
+        if (flow.nextDeadline(now)) |d| if (d < timeout_ms.*) {
+            timeout_ms.* = @max(0, d);
+        };
+    }
+}
+
+fn dispatchEvent(table: *Table, ev: reactor_mod.Event) void {
+    const flow: *Flow = @ptrCast(@alignCast(ev.ctx));
+    if (flow.state == .closed) return;
+    switch (flow.transport) {
+        .tcp => tcpEvent(table, flow, ev),
+        .udp => udpEvent(table, flow, ev),
+        else => {},
+    }
+}
+
+fn tcpEvent(table: *Table, flow: *Flow, ev: reactor_mod.Event) void {
+    switch (flow.state) {
+        .connecting => {
+            if (ev.writable or ev.readable or ev.hup) {
+                const code = sockError(flow.handle.?);
+                if (code != 0 or ev.hup) return failDial(flow, mapSockErr(code));
+                flow.state = .open;
+                flow.last_active = clock.monotonicMs();
+                flow.credit = proto.initial_window;
+                table.link.send(.connect_ok, flow.id, &.{}) catch {};
+                if (table.on_dialed) |hook| hook.func(hook.ctx, flow.target, flow.handle.?);
+                table.dialing -|= 1;
+            }
+        },
+        .open => {
+            if (ev.readable) tcpRead(table, flow);
+            if (ev.writable) tcpWrite(table, flow);
+            if (ev.hup and flow.inbox.items.len == 0 and !flow.send_closed) tcpWrite(table, flow);
+        },
+        else => {},
+    }
+}
+
+fn tcpRead(table: *Table, flow: *Flow) void {
+    const h = flow.handle orelse return;
+    var buf: [proto.max_payload]u8 = undefined;
+    while (flow.credit > 0 and !flow.aborted) {
+        const max = @min(flow.credit, buf.len);
+        const n = sock.recv(h, buf[0..max]) catch |err| switch (err) {
+            error.Timeout => return,
+            else => {
+                flow.abortLocked();
+                table.link.send(.reset, flow.id, &.{}) catch {};
+                return;
+            },
+        };
+        if (n == 0) {
+            table.link.send(.fin, flow.id, &.{}) catch {};
+            flow.open_dirs -|= 1;
+            flow.credit = 0; // stop reading
+            return;
+        }
+        flow.credit -= @intCast(n);
+        table.link.send(.data, flow.id, buf[0..n]) catch {
+            flow.abortLocked();
+            return;
+        };
+    }
+}
+
+fn tcpWrite(table: *Table, flow: *Flow) void {
+    const h = flow.handle orelse return;
+    while (flow.inbox.items.len > 0 and !flow.aborted) {
+        const n = sock.send(h, flow.inbox.items) catch {
+            flow.abortLocked();
+            table.link.send(.reset, flow.id, &.{}) catch {};
+            return;
+        };
+        if (n == 0) break;
+        if (n < flow.inbox.items.len) std.mem.copyForwards(u8, flow.inbox.items[0 .. flow.inbox.items.len - n], flow.inbox.items[n..]);
+        flow.inbox.shrinkRetainingCapacity(flow.inbox.items.len - n);
+        flow.unreported +|= @intCast(n);
+    }
+    if (flow.unreported >= window_batch or (flow.inbox.items.len == 0 and flow.unreported > 0)) {
+        table.link.sendWindow(flow.id, flow.unreported) catch {};
+        flow.unreported = 0;
+    }
+    if (flow.inbox_fin and flow.inbox.items.len == 0 and !flow.send_closed) {
+        sock.shutdown(h, .send);
+        flow.send_closed = true;
+        flow.open_dirs -|= 1;
+    }
+    if (flow.open_dirs == 0) flow.abortLocked();
+}
+
+fn udpEvent(table: *Table, flow: *Flow, ev: reactor_mod.Event) void {
+    if (!ev.readable) return;
+    const h = flow.handle orelse return;
+    var buf: [proto.max_payload]u8 = undefined;
+    while (true) {
+        const n = sock.recv(h, &buf) catch |err| switch (err) {
+            error.Timeout => return,
+            error.ConnectionReset => {
+                table.link.send(.icmp_unreachable, flow.id, &.{3}) catch {};
+                return;
+            },
+            else => return,
+        };
+        flow.last_active = clock.monotonicMs();
+        table.link.sendDroppable(.data, flow.id, buf[0..n]) catch {
+            flow.abortLocked();
+            return;
+        };
+    }
+}
+
+fn tickTime(table: *Table) void {
+    const now = clock.monotonicMs();
+    var it = table.flows.valueIterator();
+    while (it.next()) |fp| {
+        const flow = fp.*;
+        if (flow.aborted) continue;
+        switch (flow.state) {
+            .connecting => if (now - flow.created > flow.dial_timeout_ms) failDial(flow, .timeout),
+            .open => if (flow.transport == .udp and !flow.no_register and now - flow.last_active > udp_idle_ms) flow.abortLocked(),
+            else => {},
+        }
+    }
+}
+
+fn startDial(flow: *Flow) void {
+    switch (flow.transport) {
+        .tcp => tcpStartConnect(flow),
+        .udp => udpStartConnect(flow),
+        else => failDial(flow, .other),
+    }
+}
+
+fn tcpStartConnect(flow: *Flow) void {
+    const addr = flow.target;
+    const flags: u32 = if (is_windows) posix.SOCK.STREAM else posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    const h = posix.socket(addr.any.family, flags, posix.IPPROTO.TCP) catch |err| {
+        return failDial(flow, proto.FailReason.fromError(err));
+    };
+    sock.setNonblocking(h) catch {
+        sock.close(h);
+        return failDial(flow, .other);
+    };
+    posix.connect(h, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {}, // normal
+        else => {
+            sock.close(h);
+            return failDial(flow, proto.FailReason.fromError(err));
+        },
+    };
+    flow.handle = h;
+    flow.last_active = clock.monotonicMs();
+}
+
+fn udpStartConnect(flow: *Flow) void {
+    const h = sock.udpConnect(flow.target) catch |err| return failDial(flow, proto.FailReason.fromError(err));
+    sock.setNonblocking(h) catch {
+        sock.close(h);
+        return failDial(flow, .other);
+    };
+    flow.handle = h;
+    flow.state = .open;
+    flow.last_active = clock.monotonicMs();
+    flow.table.link.send(.connect_ok, flow.id, &.{}) catch {};
+    flow.table.dialing -|= 1;
+}
+
+fn failDial(flow: *Flow, reason: proto.FailReason) void {
+    flow.table.link.send(.connect_fail, flow.id, &.{@intFromEnum(reason)}) catch {};
+    flow.table.dialing -|= 1;
+    flow.abortLocked();
+}
+
+fn sockError(h: sock.Handle) i32 {
+    var code: i32 = 0;
+    if (is_windows) {
+        var len: i32 = @sizeOf(i32);
+        _ = std.os.windows.ws2_32.getsockopt(h, std.os.windows.ws2_32.SOL.SOCKET, std.os.windows.ws2_32.SO.ERROR, std.mem.asBytes(&code), &len);
+    } else {
+        posix.getsockopt(h, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&code)) catch {};
+    }
+    return code;
+}
+
+fn mapSockErr(code: i32) proto.FailReason {
+    if (is_windows) {
+        return switch (code) {
+            10061 => .refused,
+            10060 => .timeout,
+            10051 => .unreachable_net,
+            10065 => .unreachable_host,
+            10013 => .prohibited,
+            else => .other,
+        };
+    }
+    return switch (@as(posix.E, @enumFromInt(code))) {
+        .CONNREFUSED => .refused,
+        .TIMEDOUT => .timeout,
+        .NETUNREACH => .unreachable_net,
+        .HOSTUNREACH => .unreachable_host,
+        .ACCES, .PERM => .prohibited,
+        else => .other,
+    };
+}

@@ -173,7 +173,11 @@ fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop:
     };
     log.info("connected, tunnel is up ({s})", .{if (cfg.tls) "TLS" else "no TLS"});
 
-    var session: Session = .{ .gpa = gpa, .link = res.link, .table = .init(gpa, res.link) };
+    const table = relay.Table.init(gpa, res.link) catch |err| {
+        res.link.destroy();
+        return err;
+    };
+    var session: Session = .{ .gpa = gpa, .link = res.link, .table = table };
     // Stop/expiry must also end a session that is blocked waiting for frames.
     const watchdog = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Session.watch, .{ &session, cfg, stop }) catch null;
     session.run();
@@ -188,7 +192,7 @@ fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop:
 const Session = struct {
     gpa: Allocator,
     link: *Link,
-    table: relay.Table,
+    table: *relay.Table,
     /// Only touched by the dispatch thread.
     listeners: std.AutoHashMapUnmanaged(u32, *Listener) = .empty,
     icmp_inflight: std.atomic.Value(u32) = .init(0),
@@ -284,7 +288,7 @@ const Session = struct {
         }.f;
         if (self.listeners.contains(id)) return fail(self, id, "duplicate listener id");
         const bind = proto.Endpoint.decode(payload) catch return fail(self, id, "invalid request");
-        const l = Listener.start(self.gpa, &self.table, id, bind) catch |err| return fail(self, id, @errorName(err));
+        const l = Listener.start(self.gpa, self.table, id, bind) catch |err| return fail(self, id, @errorName(err));
         self.listeners.put(self.gpa, id, l) catch {
             l.stop();
             return fail(self, id, "OutOfMemory");

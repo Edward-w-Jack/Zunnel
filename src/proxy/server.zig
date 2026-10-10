@@ -36,7 +36,7 @@ pub const Session = struct {
     /// Upstream agent this session was relayed through (see `relay` command).
     via: ?u32 = null,
     /// Flows accepted by this agent's listeners, dialed on the proxy side.
-    relay: relay.Table,
+    relay: *relay.Table,
     /// Next id for TUN flows / pings (guarded by netstack.lock).
     next_flow_id: u32 = 1,
 
@@ -223,7 +223,12 @@ pub const Server = struct {
             transport.close();
             return;
         };
+        const relay_table = common.relay.Table.init(self.gpa, hs.link) catch {
+            hs.link.destroy();
+            return;
+        };
         const s = self.gpa.create(Session) catch {
+            relay_table.shutdown();
             hs.link.destroy();
             return;
         };
@@ -232,7 +237,7 @@ pub const Server = struct {
             .link = hs.link,
             .remote = conn.address,
             .hello = self.gpa.dupe(u8, hs.hello) catch &.{},
-            .relay = .init(self.gpa, hs.link),
+            .relay = relay_table,
             .joined_ms = common.clock.monotonicMs(),
         };
         s.relay.on_dialed = .{ .ctx = s, .func = onRelayDialed };
