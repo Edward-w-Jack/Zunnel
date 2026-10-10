@@ -82,11 +82,16 @@ pub const Table = struct {
         const hdr = packet.parseIp4Header(pkt) orelse return null;
         if (!packet.ip4IsFragment(hdr)) return pkt;
 
-        // Reject the fragment if its payload would overflow the max datagram.
-        const end = @as(u32, hdr.frag_offset) + @as(u32, @intCast(hdr.payload.len));
-        if (end > max_packet) return null;
-
         const key: Key = .{ .src = hdr.src, .dst = hdr.dst, .proto = hdr.proto, .ip_id = hdr.ip_id };
+        // Even with the minimal 20-byte header, a datagram's payload ends by
+        // 65515. A fragment reaching past that can never complete a valid
+        // packet, so the whole reassembly goes.
+        const end = @as(u32, hdr.frag_offset) + @as(u32, @intCast(hdr.payload.len));
+        if (end > max_packet - 20) {
+            if (self.find(key)) |e| self.drop(e);
+            return null;
+        }
+
         const entry = self.find(key) orelse self.create(key, now) orelse return null;
 
         if (hdr.frag_offset == 0 and !entry.have_head) {
@@ -217,13 +222,20 @@ pub const Table = struct {
         };
         if (!covers) return null;
 
+        // With IP options the header is longer than 20 bytes: check the
+        // real total against the 16-bit length field.
+        const header_len = e.header_len;
+        const total_len: u32 = @as(u32, header_len) + total_payload;
+        if (total_len > max_packet) {
+            self.drop(e);
+            return null;
+        }
+
         // Collapse the 60-byte header slot into the real header length,
         // producing a contiguous [header | payload] in buf[0..total_len].
-        const header_len = e.header_len;
         if (header_len != 60) {
             std.mem.copyForwards(u8, e.buf[header_len .. header_len + total_payload], e.buf[60 .. 60 + total_payload]);
         }
-        const total_len: u32 = @as(u32, header_len) + total_payload;
 
         // Rewrite the IP header's total-length, flags/offset and checksum.
         std.mem.writeInt(u16, e.buf[2..4], @intCast(total_len), .big);
@@ -372,6 +384,26 @@ test "overflow is rejected" {
     // offset near max; payload would push total past 65535.
     const f = makeFragment(&buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, packet.proto_udp, 1, 65528, false, "overflow");
     try std.testing.expect(t.offer(f, 1_000) == null);
+    try std.testing.expectEqual(@as(usize, 0), t.count());
+}
+
+test "fragments reaching past the IPv4 maximum are dropped, not reassembled" {
+    const gpa = std.testing.allocator;
+    var t: Table = .init(gpa);
+    defer t.deinit();
+    // Fragments covering payload bytes 0..65535: with the 20-byte header
+    // that would be a 65555-byte packet, which doesn't fit the u16 length.
+    var payload: [1480]u8 = undefined;
+    @memset(&payload, 0xab);
+    var buf: [1500]u8 = undefined;
+    var off: u32 = 0;
+    while (off < 65535) {
+        const take: u32 = @min(payload.len, 65535 - off);
+        const more = off + take < 65535;
+        const f = makeFragment(&buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, packet.proto_icmp, 3, @intCast(off), more, payload[0..take]);
+        try std.testing.expect(t.offer(f, 1_000) == null);
+        off += take;
+    }
     try std.testing.expectEqual(@as(usize, 0), t.count());
 }
 

@@ -317,7 +317,9 @@ translates the result back into packets:
 - Failed dials are cached for 10 s, so retransmitted SYNs get the same answer without another dial.
 - Large UDP datagrams (DNS over UDP with EDNS, QUIC, nmap's `-sU --data-length`) are supported in
   both directions: the proxy reassembles IPv4 fragments arriving from the TUN and fragments
-  oversized replies before writing them back. Up to the IPv4 UDP maximum of 65,507 bytes.
+  oversized replies before writing them back. Up to the IPv4 UDP maximum of 65,507 bytes;
+  fragments that would reassemble past the IPv4 maximum are dropped, and each fragmented reply
+  gets its own IP ID so concurrent large replies can't be mixed up.
 - Not possible through any unprivileged pivot: `-sA/-sF/-sN/-sX/-sW`, `-O`, `--traceroute`.
 
 ## Done
@@ -350,8 +352,9 @@ translates the result back into packets:
   thread model with one `poll`/`WSAPoll` thread per link
 - [x] P3 review fixes: finished and reset connections are released at once (the relay thread
   no longer spins on their sockets), reads on drained Windows sockets no longer reset the flow,
-  aborted dials return their slot, slow receivers get backpressure instead of a reset, and send
-  and connect errors that Zig's std wrappers treat as impossible no longer crash the process
+  aborted dials return their slot, slow receivers get backpressure instead of a reset, send
+  and connect errors that Zig's std wrappers treat as impossible no longer crash the process,
+  oversize fragment sets no longer crash the proxy, and fragmented replies get unique IP IDs
 
 ## Roadmap
 

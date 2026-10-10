@@ -206,6 +206,8 @@ pub const Tunnel = struct {
     icmp: std.AutoHashMapUnmanaged(u32, PendingIcmp) = .empty,
     recent: std.AutoHashMapUnmanaged(Tuple, Recent) = .empty,
     reassembly: reassemble.Table = undefined,
+    /// IP ID of the last datagram `writeIp` had to fragment.
+    next_ip_id: u16 = 0,
     /// TCP dials in flight; SYNs beyond `max_dials` wait in `dial_queue`.
     dialing: u32 = 0,
     dial_queue: std.ArrayList(u32) = .empty,
@@ -683,10 +685,12 @@ pub const Tunnel = struct {
     }
 
     /// Writes an IPv4 packet to the TUN, fragmenting if it exceeds the MTU.
-    /// Fragments share the input packet's ip_id; the receiver reassembles.
+    /// The packets we build all carry IP ID 0, so each fragmented datagram
+    /// gets a fresh one: the receiver must not mix up two large replies.
     fn writeIp(self: *Tunnel, pkt: []const u8) void {
         if (pkt.len <= tun.mtu) return self.dev.write(pkt);
-        var it = packet.fragmentIp4(pkt, tun.mtu) catch {
+        self.next_ip_id +%= 1;
+        var it = packet.fragmentIp4(pkt, tun.mtu, self.next_ip_id) catch {
             // Give the oversize packet to the TUN anyway and let the OS drop
             // or truncate it -- better than silence.
             return self.dev.write(pkt);
