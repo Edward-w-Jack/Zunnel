@@ -136,7 +136,6 @@ pub fn main() !void {
             if (!agent.quiet) std.debug.print("agent expired\n", .{});
             std.process.exit(0);
         },
-        .key_mismatch => fatal("handshake rejected: wrong -pubkey, -secret, or mismatched zunnel versions", .{}),
     }
 }
 

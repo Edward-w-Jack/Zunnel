@@ -46,6 +46,59 @@ const lwip_cflags = [_][]const u8{
     "-Wno-unused-but-set-variable",
 };
 
+/// Every .c in mbedTLS 3.6's library/ directory except `net_sockets.c`
+/// (we don't want mbedTLS doing its own socket I/O) and `timing.c`
+/// (not needed for TLS 1.3 server, and uses OS-specific APIs that aren't
+/// built in our minimal config). Each file's body is still guarded by
+/// MBEDTLS_* defines, so unused features compile to nothing.
+const mbedtls_files = [_][]const u8{
+    "aes.c",                                     "aesce.c",                  "aesni.c",
+    "aria.c",                                    "asn1parse.c",              "asn1write.c",
+    "base64.c",                                  "bignum.c",                 "bignum_core.c",
+    "bignum_mod.c",                              "bignum_mod_raw.c",         "block_cipher.c",
+    "camellia.c",                                "ccm.c",                    "chacha20.c",
+    "chachapoly.c",                              "cipher.c",                 "cipher_wrap.c",
+    "cmac.c",                                    "constant_time.c",          "ctr_drbg.c",
+    "debug.c",                                   "des.c",                    "dhm.c",
+    "ecdh.c",                                    "ecdsa.c",                  "ecjpake.c",
+    "ecp.c",                                     "ecp_curves.c",             "ecp_curves_new.c",
+    "entropy.c",                                 "entropy_poll.c",           "error.c",
+    "gcm.c",                                     "hkdf.c",                   "hmac_drbg.c",
+    "lmots.c",                                   "lms.c",                    "md.c",
+    "md5.c",                                     "memory_buffer_alloc.c",    "mps_reader.c",
+    "mps_trace.c",                               "nist_kw.c",                "oid.c",
+    "padlock.c",                                 "pem.c",                    "pk.c",
+    "pk_ecc.c",                                  "pk_wrap.c",                "pkcs12.c",
+    "pkcs5.c",                                   "pkcs7.c",                  "pkparse.c",
+    "pkwrite.c",                                 "platform.c",               "platform_util.c",
+    "poly1305.c",                                "psa_crypto.c",             "psa_crypto_aead.c",
+    "psa_crypto_cipher.c",                       "psa_crypto_client.c",      "psa_crypto_driver_wrappers_no_static.c",
+    "psa_crypto_ecp.c",                          "psa_crypto_ffdh.c",        "psa_crypto_hash.c",
+    "psa_crypto_mac.c",                          "psa_crypto_pake.c",        "psa_crypto_random.c",
+    "psa_crypto_rsa.c",                          "psa_crypto_se.c",          "psa_crypto_slot_management.c",
+    "psa_crypto_storage.c",                      "psa_its_file.c",           "psa_util.c",
+    "ripemd160.c",                               "rsa.c",                    "rsa_alt_helpers.c",
+    "sha1.c",                                    "sha256.c",                 "sha3.c",
+    "sha512.c",                                  "ssl_cache.c",              "ssl_ciphersuites.c",
+    "ssl_client.c",                              "ssl_cookie.c",             "ssl_debug_helpers_generated.c",
+    "ssl_msg.c",                                 "ssl_ticket.c",             "ssl_tls.c",
+    "ssl_tls12_client.c",                        "ssl_tls12_server.c",       "ssl_tls13_client.c",
+    "ssl_tls13_generic.c",                       "ssl_tls13_keys.c",         "ssl_tls13_server.c",
+    "threading.c",                               "version.c",                "version_features.c",
+    "x509.c",                                    "x509_create.c",            "x509_crl.c",
+    "x509_crt.c",                                "x509_csr.c",               "x509write.c",
+    "x509write_crt.c",                           "x509write_csr.c",
+};
+
+const mbedtls_cflags = [_][]const u8{
+    "-std=c99",
+    "-fno-sanitize=undefined",
+    "-Wno-unused-but-set-variable",
+    "-Wno-unused-function",
+    "-Wno-unused-parameter",
+    "-Wno-pedantic",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // `zig build -Drelease` builds ReleaseSafe: both binaries parse untrusted
@@ -118,6 +171,31 @@ pub fn build(b: *std.Build) void {
         lwip.root_module.addCSourceFile(.{ .file = patched, .flags = &lwip_cflags });
     }
 
+    // --------------------------------------------------------------- mbedTLS
+    // The proxy's TLS 1.3 transport runs on mbedTLS. The agent uses Zig's
+    // std.crypto.tls.Client (phase 5), so the agent never links mbedTLS.
+    const mbedtls_dep = b.dependency("mbedtls", .{});
+    const mbedtls = b.addLibrary(.{
+        .name = "mbedtls",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mbedtls.root_module.addIncludePath(mbedtls_dep.path("include"));
+    mbedtls.root_module.addIncludePath(mbedtls_dep.path("library"));
+    mbedtls.root_module.addCSourceFiles(.{
+        .root = mbedtls_dep.path("library"),
+        .files = &mbedtls_files,
+        .flags = &mbedtls_cflags,
+    });
+    if (target.result.os.tag == .windows) {
+        mbedtls.root_module.linkSystemLibrary("bcrypt", .{}); // entropy source
+        mbedtls.root_module.linkSystemLibrary("ws2_32", .{});
+    }
+
     // ---------------------------------------------------------------- proxy
     const proxy_mod = b.createModule(.{
         .root_source_file = b.path("src/proxy/main.zig"),
@@ -129,7 +207,9 @@ pub fn build(b: *std.Build) void {
     });
     proxy_mod.addIncludePath(b.path("src/lwip"));
     proxy_mod.addIncludePath(lwip_dep.path("src/include"));
+    proxy_mod.addIncludePath(mbedtls_dep.path("include"));
     proxy_mod.linkLibrary(lwip);
+    proxy_mod.linkLibrary(mbedtls);
     const proxy = b.addExecutable(.{ .name = "zunnel-proxy", .root_module = proxy_mod });
     b.installArtifact(proxy);
 

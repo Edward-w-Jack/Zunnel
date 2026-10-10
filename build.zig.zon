@@ -8,6 +8,10 @@
             .url = "https://github.com/lwip-tcpip/lwip/archive/refs/tags/STABLE-2_2_1_RELEASE.tar.gz",
             .hash = "N-V-__8AAGSTdQCcOKeNITCRoYez502saFXZqz4ucBJ4xTa9",
         },
+        .mbedtls = .{
+            .url = "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/mbedtls-3.6.7.tar.gz",
+            .hash = "N-V-__8AALrvlQKVtYlvv9dpBnbrJfdwR_F0wAgwsvZhAF1Y",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tools" },
 }
