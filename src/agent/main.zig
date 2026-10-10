@@ -37,6 +37,9 @@ const usage =
     \\  -expire <when>        stop for good at a UTC time (2026-10-20T18:00Z)
     \\                        or after a duration (90m, 72h, 7d)  (env ZUNNEL_EXPIRE)
     \\  -id <id>              override the host-derived agent id  (env ZUNNEL_ID)
+    \\  -no-tls               use raw TCP instead of TLS; proxy needs -no-tls too
+    \\  -tls-verify           require the proxy's TLS cert to match -connect's host
+    \\  -ca <file>            PEM CA bundle used with -tls-verify
     \\  -q                    quiet: print nothing
     \\  -v                    verbose: also log each failed dial and port-unreachable
     \\
@@ -55,7 +58,7 @@ fn argLayer(args: []const [:0]u8) config.Layer {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = std.mem.trimLeft(u8, args[i], "-");
-        const takes_value = for ([_][]const u8{ "connect", "pubkey", "secret", "expire", "id" }) |n| {
+        const takes_value = for ([_][]const u8{ "connect", "pubkey", "secret", "expire", "id", "ca" }) |n| {
             if (std.mem.eql(u8, a, n)) break true;
         } else false;
         const value: ?[]const u8 = if (takes_value) blk: {
@@ -73,6 +76,12 @@ fn argLayer(args: []const [:0]u8) config.Layer {
             l.expire = value;
         } else if (std.mem.eql(u8, a, "id")) {
             l.id = value;
+        } else if (std.mem.eql(u8, a, "ca")) {
+            l.ca = value;
+        } else if (std.mem.eql(u8, a, "no-tls")) {
+            l.no_tls = true;
+        } else if (std.mem.eql(u8, a, "tls-verify")) {
+            l.tls_verify = true;
         } else if (std.mem.eql(u8, a, "retry")) {
             l.retry = true;
         } else if (std.mem.eql(u8, a, "q")) {
@@ -101,6 +110,7 @@ fn envLayer(gpa: std.mem.Allocator) config.Layer {
         .secret = get(gpa, "ZUNNEL_SECRET"),
         .expire = get(gpa, "ZUNNEL_EXPIRE"),
         .id = get(gpa, "ZUNNEL_ID"),
+        .ca = get(gpa, "ZUNNEL_CA"),
     };
 }
 
@@ -111,6 +121,9 @@ fn bakedLayer() config.Layer {
         .secret = baked.secret,
         .expire = baked.expire,
         .id = baked.id,
+        .ca = baked.ca,
+        .no_tls = baked.no_tls,
+        .tls_verify = baked.tls_verify,
         // A baked agent is meant to stay up: reconnect unless told otherwise.
         .retry = baked.retry orelse if (baked.connect != null) true else null,
     };

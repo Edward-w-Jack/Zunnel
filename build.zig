@@ -121,7 +121,10 @@ pub fn build(b: *std.Build) void {
     agent_opts.addOption(?[]const u8, "secret", b.option([]const u8, "agent-secret", "Bake in the shared secret"));
     agent_opts.addOption(?[]const u8, "expire", b.option([]const u8, "agent-expire", "Bake in an expiry (UTC time or duration)"));
     agent_opts.addOption(?[]const u8, "id", b.option([]const u8, "agent-id", "Bake in an agent id (default: derived from the host)"));
+    agent_opts.addOption(?[]const u8, "ca", b.option([]const u8, "agent-ca", "Bake in a path to a PEM CA bundle"));
     agent_opts.addOption(?bool, "retry", b.option(bool, "agent-retry", "Reconnect forever (default: on when -Dagent-connect is set)"));
+    agent_opts.addOption(?bool, "no_tls", b.option(bool, "agent-no-tls", "Bake in -no-tls (raw TCP, matches proxy -no-tls)"));
+    agent_opts.addOption(?bool, "tls_verify", b.option(bool, "agent-tls-verify", "Bake in -tls-verify (require matching TLS cert)"));
 
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/main.zig"),

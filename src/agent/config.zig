@@ -21,6 +21,12 @@ pub const Config = struct {
     expire_at_ms: ?i64,
     /// Overrides the host-derived identity.
     id: ?[]const u8,
+    /// If true, wrap the link in TLS (the proxy's default).
+    tls: bool,
+    /// If true, require the proxy's cert to match the host and chain to -ca.
+    tls_verify: bool,
+    /// Path to a CA bundle (PEM) for -tls-verify. null = no CA store loaded.
+    ca_path: ?[]const u8,
 };
 
 /// One configuration source; null fields defer to lower-precedence sources.
@@ -31,6 +37,9 @@ pub const Layer = struct {
     expire: ?[]const u8 = null,
     id: ?[]const u8 = null,
     retry: ?bool = null,
+    no_tls: ?bool = null,
+    tls_verify: ?bool = null,
+    ca: ?[]const u8 = null,
 };
 
 pub const Error = error{
@@ -64,6 +73,9 @@ pub fn resolve(layers: []const Layer, now_ms: i64) Error!Config {
         .retry = first("retry", layers) orelse false,
         .expire_at_ms = expire_at_ms,
         .id = first("id", layers),
+        .tls = !(first("no_tls", layers) orelse false),
+        .tls_verify = first("tls_verify", layers) orelse false,
+        .ca_path = first("ca", layers),
     };
 }
 

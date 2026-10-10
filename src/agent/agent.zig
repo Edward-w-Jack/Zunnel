@@ -13,6 +13,7 @@ const Link = common.Link;
 const Listener = @import("listener.zig").Listener;
 const icmp = @import("icmp.zig");
 const netinfo = @import("netinfo.zig");
+const tls = @import("tls.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
@@ -124,20 +125,53 @@ fn buildHello(gpa: Allocator, cfg: Config) ![]u8 {
 
 const SessionEnd = enum(u8) { disconnected, killed, expired, stopped };
 
+/// Wraps `handle` in a TLS Stream (cfg.tls) or a plain TcpStream, and
+/// closes `handle` on error. Loads the CA bundle for -tls-verify if asked.
+fn openStream(gpa: Allocator, cfg: Config, handle: common.sock.Handle) !common.stream.Stream {
+    if (!cfg.tls) return common.stream.TcpStream.wrap(gpa, handle) catch |err| {
+        common.sock.close(handle);
+        return err;
+    };
+
+    var ca: ?std.crypto.Certificate.Bundle = null;
+    if (cfg.ca_path) |path| {
+        var bundle: std.crypto.Certificate.Bundle = .{};
+        errdefer bundle.deinit(gpa);
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            log.err("cannot open -ca file '{s}': {s}", .{ path, @errorName(err) });
+            common.sock.close(handle);
+            return err;
+        };
+        defer file.close();
+        bundle.addCertsFromFile(gpa, file) catch |err| {
+            log.err("cannot read -ca file '{s}': {s}", .{ path, @errorName(err) });
+            common.sock.close(handle);
+            return err;
+        };
+        ca = bundle;
+    }
+    errdefer if (ca) |*b| b.deinit(gpa);
+
+    return tls.connect(gpa, handle, .{
+        .host = if (cfg.tls_verify) cfg.host else null,
+        .ca = ca,
+    });
+}
+
 fn runSession(gpa: Allocator, cfg: Config, psk: [32]u8, hello: []const u8, stop: *std.atomic.Value(bool)) !SessionEnd {
     log.info("connecting to {s}:{d}", .{ cfg.host, cfg.port });
     const tcp = try std.net.tcpConnectToHost(gpa, cfg.host, cfg.port);
     common.sock.setKeepAlive(tcp.handle);
     common.sock.setNoDelay(tcp.handle);
-    const transport = common.stream.TcpStream.wrap(gpa, tcp.handle) catch |err| {
-        tcp.close();
+    const transport = openStream(gpa, cfg, tcp.handle) catch |err| {
+        // openStream closed the handle on failure.
         return err;
     };
     const res = common.link.clientHandshake(gpa, transport, cfg.pubkey, psk, hello) catch |err| {
         transport.close();
         return err;
     };
-    log.info("connected, tunnel is up", .{});
+    log.info("connected, tunnel is up ({s})", .{if (cfg.tls) "TLS" else "no TLS"});
 
     var session: Session = .{ .gpa = gpa, .link = res.link, .table = .init(gpa, res.link) };
     // Stop/expiry must also end a session that is blocked waiting for frames.
@@ -345,6 +379,9 @@ test "run ends cleanly when the proxy kills the agent or the embedder stops it" 
         .retry = false,
         .expire_at_ms = null,
         .id = "test-agent",
+        .tls = false, // the test proxy speaks raw TCP (ZNL6)
+        .tls_verify = false,
+        .ca_path = null,
     };
     for ([_]RunResult{ .killed, .stopped }) |want| {
         var proxy: FakeProxy = .{ .listener = &listener, .key = key, .send_kill = want == .killed };
