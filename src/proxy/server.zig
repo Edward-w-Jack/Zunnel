@@ -4,6 +4,7 @@ const std = @import("std");
 const common = @import("common");
 const netstack = @import("netstack.zig");
 const tun = @import("tun.zig");
+const tls = @import("tls.zig");
 const Tunnel = @import("tunnel.zig").Tunnel;
 const ui = @import("ui.zig");
 
@@ -94,6 +95,8 @@ pub const Server = struct {
     max_dials: u32 = 256,
     /// Agents connect without a shared secret (warned about on every join).
     no_secret: bool = false,
+    /// Null = TLS off (raw TCP only). Owned by `Server`.
+    tls_server: ?*tls.Server = null,
 
     /// Guards everything below. Lock order: Server.mutex -> netstack.lock.
     mutex: std.Thread.Mutex = .{},
@@ -124,6 +127,29 @@ pub const Server = struct {
         var a = self.listen_address;
         if (a.any.family == std.posix.AF.INET and a.in.sa.addr == 0) a = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, a.getPort());
         return a;
+    }
+
+    /// First byte: 0x16 is a TLS 1.x handshake record. Everything else means
+    /// raw TCP (ZNL6 Noise). Allow 2 s for the client to send that first byte
+    /// -- a legitimate client sends it right away.
+    fn wrapStream(self: *Server, conn: std.net.Server.Connection) !common.stream.Stream {
+        if (self.tls_server) |tls_server| {
+            const first = sock.peekByte(conn.stream.handle, 2000) catch |err| {
+                log.warn("peek from {f} failed: {s}", .{ conn.address, @errorName(err) });
+                conn.stream.close();
+                return err;
+            };
+            if (first == 0x16) {
+                return tls_server.accept(conn.stream.handle) catch |err| {
+                    // tls.Server.accept closed the handle itself on error.
+                    return err;
+                };
+            }
+        }
+        return common.stream.TcpStream.wrap(self.gpa, conn.stream.handle) catch |err| {
+            conn.stream.close();
+            return err;
+        };
     }
 
     fn acceptLoop(self: *Server, listener_: std.net.Server) void {
@@ -182,16 +208,16 @@ pub const Server = struct {
         var hello_buf: [common.link.max_hello_len]u8 = undefined;
         sock.setKeepAlive(conn.stream.handle);
         sock.setNoDelay(conn.stream.handle);
-        const transport = common.stream.TcpStream.wrap(self.gpa, conn.stream.handle) catch {
+        const transport = self.wrapStream(conn) catch {
             self.endHandshake(conn.address);
-            conn.stream.close();
+            // wrapStream closed `conn.stream.handle` on error.
             return;
         };
         const hs_result = common.link.serverHandshake(self.gpa, transport, self.static, self.psk, &hello_buf);
         self.endHandshake(conn.address);
         const hs = hs_result catch |err| {
             switch (err) {
-                error.AuthenticationFailed => log.warn("rejected agent {f}: wrong -secret (or an agent from a different zunnel version)", .{conn.address}),
+                error.AuthenticationFailed => log.warn("rejected agent {f}: wrong -pubkey, -secret, or mismatched zunnel versions", .{conn.address}),
                 else => log.warn("handshake with {f} failed: {s}", .{ conn.address, @errorName(err) }),
             }
             transport.close();

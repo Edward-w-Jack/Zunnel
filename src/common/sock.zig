@@ -64,6 +64,31 @@ pub fn sendAll(h: Handle, data: []const u8) SendError!void {
     while (off < data.len) off += try send(h, data[off..]);
 }
 
+/// Returns the first byte that is already in the OS receive buffer, without
+/// consuming it (MSG_PEEK). Waits up to `timeout_ms` for a byte to arrive,
+/// null on timeout, error.EndOfStream on orderly close.
+pub fn peekByte(h: Handle, timeout_ms: i32) (RecvError || error{EndOfStream})!?u8 {
+    if (!pollRead(h, timeout_ms)) return null;
+    var b: [1]u8 = undefined;
+    if (is_windows) {
+        const n = ws2.recv(h, &b, 1, 0x2); // MSG_PEEK = 2
+        if (n == ws2.SOCKET_ERROR) return switch (ws2.WSAGetLastError()) {
+            .WSAETIMEDOUT => error.Timeout,
+            .WSAECONNRESET, .WSAECONNABORTED, .WSAESHUTDOWN => error.ConnectionReset,
+            else => error.RecvFailed,
+        };
+        if (n == 0) return error.EndOfStream;
+        return b[0];
+    }
+    const n = posix.recv(h, &b, posix.MSG.PEEK) catch |err| return switch (err) {
+        error.WouldBlock => null,
+        error.ConnectionResetByPeer, error.ConnectionRefused, error.SocketNotConnected => error.ConnectionReset,
+        else => error.RecvFailed,
+    };
+    if (n == 0) return error.EndOfStream;
+    return b[0];
+}
+
 pub const How = enum { recv, send, both };
 
 pub fn shutdown(h: Handle, how: How) void {

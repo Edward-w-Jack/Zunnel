@@ -7,6 +7,7 @@ const privileges = @import("privileges.zig");
 const ui = @import("ui.zig");
 const lineedit = @import("lineedit.zig");
 const tun = @import("tun.zig");
+const tls = @import("tls.zig");
 const server_mod = @import("server.zig");
 const tunnel_mod = @import("tunnel.zig");
 const Tunnel = tunnel_mod.Tunnel;
@@ -26,6 +27,9 @@ const usage =
     \\  -key <file>          proxy key and shared secret, created if missing (default zunnel.key)
     \\  -secret <secret>     override the shared secret stored in the key file
     \\  -no-secret           accept agents without a secret (not recommended)
+    \\  -no-tls              accept raw TCP only (no TLS; agents need -no-tls too)
+    \\  -cert <file>         TLS certificate (default zunnel.cert, generated if missing)
+    \\  -cert-key <file>     TLS private key (default zunnel.cert.key, generated if missing)
     \\  -config <file>       run the console commands in <file> at startup (see `save`)
     \\  -log <file>          append timestamped events and log lines to <file>
     \\  -v / -q              verbose (debug) / quiet (warnings and events only)
@@ -44,6 +48,9 @@ const Options = struct {
     key_file: []const u8 = "zunnel.key",
     secret: ?[]const u8 = null,
     no_secret: bool = false,
+    no_tls: bool = false,
+    cert_file: []const u8 = "zunnel.cert",
+    cert_key_file: []const u8 = "zunnel.cert.key",
     config_file: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
     tun_name: []const u8 = "zunnel",
@@ -72,6 +79,10 @@ fn parseArgs(gpa: Allocator, args: []const [:0]u8) !Options {
             o.no_secret = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "no-tls")) {
+            o.no_tls = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "v")) {
             ui.level = .debug;
             continue;
@@ -93,6 +104,10 @@ fn parseArgs(gpa: Allocator, args: []const [:0]u8) !Options {
             o.key_file = v;
         } else if (std.mem.eql(u8, a, "secret")) {
             o.secret = v;
+        } else if (std.mem.eql(u8, a, "cert")) {
+            o.cert_file = v;
+        } else if (std.mem.eql(u8, a, "cert-key")) {
+            o.cert_key_file = v;
         } else if (std.mem.eql(u8, a, "config")) {
             o.config_file = v;
         } else if (std.mem.eql(u8, a, "log")) {
@@ -132,6 +147,9 @@ pub fn main() !void {
     if (opts.no_secret and opts.secret != null) fatal("-secret and -no-secret are mutually exclusive", .{});
     const secret: []const u8 = if (opts.no_secret) "" else opts.secret orelse &ident.secret;
 
+    const tls_server = if (opts.no_tls) null else tls.Server.init(gpa, opts.cert_file, opts.cert_key_file) catch |err|
+        fatal("cannot initialise TLS ({s}, {s}): {s}", .{ opts.cert_file, opts.cert_key_file, @errorName(err) });
+
     var server: Server = .{
         .gpa = gpa,
         .static = ident.keypair,
@@ -143,6 +161,7 @@ pub fn main() !void {
         .default_localhost_net = opts.localhost_net,
         .dial_timeout_ms = opts.dial_timeout_ms,
         .max_dials = opts.max_dials,
+        .tls_server = tls_server,
     };
     var console: Console = .{ .gpa = gpa, .server = &server, .pending_routes = opts.routes, .config_path = opts.config_file };
     installShutdownHandlers(&server);
@@ -151,20 +170,23 @@ pub fn main() !void {
     server.listen() catch |err| fatal("cannot listen on {f}: {s}", .{ opts.listen, @errorName(err) });
 
     const port = opts.listen.getPort();
-    std.debug.print("zunnel proxy {s} listening on {f}\npublic key: {s}\n", .{ common.version, opts.listen, &pubkey });
+    const transport_desc = if (tls_server == null) " (TLS off; agents need -no-tls)" else "";
+    std.debug.print("zunnel proxy {s} listening on {f}{s}\npublic key: {s}\n", .{ common.version, opts.listen, transport_desc, &pubkey });
+    const agent_tls_flag: []const u8 = if (tls_server == null) " -no-tls" else "";
     if (secret.len > 0) {
         std.debug.print(
-            \\agent:      zunnel-agent -connect <this-host>:{d} -pubkey {s} -secret {s}
+            \\agent:      zunnel-agent -connect <this-host>:{d} -pubkey {s} -secret {s}{s}
             \\baked:      zig build -Drelease -Dtarget=<target> -Dagent-connect=<this-host>:{d} -Dagent-pubkey={s} -Dagent-secret={s}
             \\
-        , .{ port, &pubkey, secret, port, &pubkey, secret });
+        , .{ port, &pubkey, secret, agent_tls_flag, port, &pubkey, secret });
     } else {
         std.debug.print(
-            \\agent:      zunnel-agent -connect <this-host>:{d} -pubkey {s}
+            \\agent:      zunnel-agent -connect <this-host>:{d} -pubkey {s}{s}
             \\WARNING: -no-secret: anyone who has the public key can connect as an agent
             \\
-        , .{ port, &pubkey });
+        , .{ port, &pubkey, agent_tls_flag });
     }
+    if (tls_server == null) std.debug.print("WARNING: -no-tls: zunnel is now distinguishable on the wire\n", .{});
     std.debug.print("type 'help' for commands\n", .{});
     if (opts.config_file) |path| console.runConfig(path);
     console.run();
@@ -946,4 +968,5 @@ test {
     _ = @import("tun.zig");
     _ = @import("lineedit.zig");
     _ = @import("tunnel.zig");
+    _ = @import("tls.zig");
 }
