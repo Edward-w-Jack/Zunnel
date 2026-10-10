@@ -87,7 +87,9 @@ zunnel-agent -connect proxy.example.com:11601 -pubkey <key> -secret <secret> -re
 ```
 
 On first run the proxy writes `zunnel.key`, which holds its private key and a generated shared
-secret. The banner prints the full agent command and a matching baked-build command.
+secret, and `zunnel.cert` + `zunnel.cert.key`, a self-signed TLS certificate. The link is TLS 1.3
+by default: a new connection looks like HTTPS on the wire. `-no-tls` on both ends keeps raw TCP.
+The banner prints the full agent command and a matching baked-build command.
 
 Without `-autostart`, use the console (`help` lists everything):
 
@@ -200,6 +202,9 @@ agents are disconnected (`-retry` agents reconnect when the proxy comes back).
 | `-key <file>` | `zunnel.key` | private key and shared secret, created if missing |
 | `-secret <s>` | from key file | override the shared secret agents must present |
 | `-no-secret` | off | accept agents without a secret (warns at startup and on every join) |
+| `-no-tls` | off | accept raw TCP only (agents then also need `-no-tls`; warns at startup) |
+| `-cert <file>` | `zunnel.cert` | TLS certificate (PEM); self-signed and written on first run |
+| `-cert-key <file>` | `zunnel.cert.key` | TLS private key (PEM); generated with the cert |
 | `-config <file>` | | run console commands from a file at startup (see `save`) |
 | `-log <file>` | | append timestamped events and log lines to a file |
 | `-v` / `-q` | | verbose (debug) / quiet (warnings and events only) |
@@ -224,7 +229,9 @@ sensitive shows up in process listings.
 | `-expire <when>` | `ZUNNEL_EXPIRE` | `-Dagent-expire=` | stop for good at a UTC time or after a duration |
 | `-id <id>` | `ZUNNEL_ID` | `-Dagent-id=` | override the host-derived IDENT |
 | `-retry` | | `-Dagent-retry=` | reconnect forever (on by default for baked agents) |
-| `-insecure` | | | accept any proxy key and print its fingerprint |
+| `-no-tls` | | `-Dagent-no-tls=` | use raw TCP; the proxy needs `-no-tls` too |
+| `-tls-verify` | | `-Dagent-tls-verify=` | require the proxy's TLS cert to match `-connect`'s host |
+| `-ca <file>` | `ZUNNEL_CA` | `-Dagent-ca=` | PEM CA bundle used with `-tls-verify` |
 | `-q` | | | print nothing |
 | `-v` | | | verbose: also log each failed dial and port-unreachable |
 
@@ -261,6 +268,10 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
 - **Monotonic timers:** heartbeats and every connection timeout run on a monotonic clock, so
   changing the system time (an NTP correction, a VM resuming) doesn't drop links or stall timers.
   Only log timestamps and `-expire` use the wall clock.
+- **TLS 1.3 by default:** every new link looks like HTTPS on the wire. The TLS and Noise
+  handshakes together must complete within the 10 s handshake timeout. Noise still authenticates
+  the proxy inside TLS, so the self-signed cert is enough; `-tls-verify` and `-ca` enable a real
+  cert check for operators who want TLS to look like a normal HTTPS client.
 
 ## Scanning through the tunnel
 
@@ -303,6 +314,9 @@ translates the result back into packets:
   that redraws around the input line
 - [x] Review fixes: agent shutdown race, connection timeouts measured per state, connections the
   client abandons early cleaned up at once, monotonic timers
+- [x] P2 transports (part 1): TLS 1.3 transport (mbedTLS on the proxy, `std.crypto.tls.Client`
+  on the agent, self-signed cert on first run, `-tls-verify` for a real cert check), and the
+  ZNL6 wire with no cleartext magic and record padding
 
 ## Roadmap
 
@@ -321,9 +335,9 @@ translates the result back into packets:
 - [x] Console output that doesn't interleave with the prompt.
 
 ### P2: transports and evasion
-- [ ] Alternate transports: TLS (looks like HTTPS) and WebSocket. Agent support for HTTP CONNECT
-  proxies, with auto-detection on Windows.
-- [ ] A less distinctive handshake: no cleartext magic, optional random padding, fixed-size records.
+- [x] TLS 1.3 transport on top of the Noise link (default on; `-no-tls` keeps raw TCP).
+- [x] Less distinctive handshake: no cleartext magic, record padding to fixed-size buckets.
+- [ ] WebSocket transport and HTTP CONNECT proxy traversal (with auto-detection on Windows).
 - [ ] Windows agent built without a console window; optional run-as-service.
 
 ### P3: protocol coverage and scale
@@ -333,11 +347,3 @@ translates the result back into packets:
 - [ ] macOS proxy (utun).
 - [ ] In-repo integration lab (`lab.sh` with network namespaces) and CI cross-compiling Linux,
   Windows and macOS.
-
-### Potential future plans
-Ideas that are not scheduled yet.
-- **Agent DLL build target** (`zig build -Dagent-dll`) for reflective DLL loading: the agent
-  as a Windows DLL (x86_64 and x86) with an exported entry point that starts the agent on its own
-  thread and returns immediately. A DLL can't take command-line arguments, so it requires the
-  baked-in agent config (done in P1). It must also be safe to run inside a host process: no
-  console output, no `exit` on errors, and it reconnects (`-retry` behaviour) by default.
