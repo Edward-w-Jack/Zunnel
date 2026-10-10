@@ -280,6 +280,8 @@ zunnel-proxy -autostart -localhost-net 198.18.255.0/24 -route 198.18.255.0/24 -r
 - **Event-driven I/O:** the relay (both sides) runs on one `poll`/`WSAPoll` thread per link, so
   concurrent flows cost dozens of bytes of state instead of 256 KiB stacks. A 1,000-flow scan
   used to allocate ~750 MB of stack across threads; it now sits at a handful of threads total.
+  The thread sleeps while nothing happens, and a connection's socket is closed as soon as both
+  directions have finished or either side resets.
 - **Bounded handshakes:** at most 64 handshakes are in progress (8 per source address), each with a
   10 s timeout.
 - **Monotonic timers:** heartbeats and every connection timeout run on a monotonic clock, so
@@ -342,6 +344,9 @@ translates the result back into packets:
 - [x] P3 scale (part 1): IPv4 fragment reassembly and outbound fragmentation on the TUN,
   single-record UDP datagrams up to 65 KiB, and a reactor-driven relay that replaces the per-flow
   thread model with one `poll`/`WSAPoll` thread per link
+- [x] P3 review fixes: finished and reset connections are released at once (the relay thread
+  no longer spins on their sockets), reads on drained Windows sockets no longer reset the flow,
+  and aborted dials return their slot
 
 ## Roadmap
 

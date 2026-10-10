@@ -411,6 +411,33 @@ const HandshakeFixture = struct {
     }
 };
 
+/// Test helper: two Links joined over loopback TCP, past the handshake. The
+/// first is the agent's end, the second the proxy's; the caller destroys both.
+pub fn testPair(gpa: Allocator) !struct { *Link, *Link } {
+    const static = noise.KeyPair.generate();
+    const psk = noise.pskFromSecret("test");
+    const client, const server = try loopbackPair(gpa);
+    var server_link: ?*Link = null;
+    var fx: HandshakeFixture = .{ .static = static, .psk = psk, .gpa = gpa };
+    const t = std.Thread.spawn(.{}, HandshakeFixture.serve, .{ &fx, server.stream, &server_link }) catch |err| {
+        client.stream.close();
+        server.stream.close();
+        return err;
+    };
+    const res = clientHandshake(gpa, client.stream, static.public_key, psk, "hello=1\n");
+    t.join();
+    const agent = (res catch |err| {
+        client.stream.close();
+        if (server_link) |l| l.destroy();
+        return err;
+    }).link;
+    const proxy = server_link orelse {
+        agent.destroy();
+        return error.HandshakeFailed;
+    };
+    return .{ agent, proxy };
+}
+
 test "a max-size UDP-ish frame survives the record layer" {
     const gpa = std.testing.allocator;
     const static = noise.KeyPair.generate();

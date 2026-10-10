@@ -10,6 +10,8 @@ const is_windows = builtin.os.tag == .windows;
 
 pub const Handle = std.net.Stream.Handle;
 
+/// `Timeout`: nothing to read yet -- the receive timeout expired, or a
+/// non-blocking socket would block (POSIX reports both as EAGAIN).
 pub const RecvError = error{ Timeout, ConnectionReset, RecvFailed };
 pub const SendError = error{ ConnectionReset, SendFailed };
 
@@ -19,7 +21,7 @@ pub fn recv(h: Handle, buf: []u8) RecvError!usize {
         const len: i32 = @intCast(@min(buf.len, std.math.maxInt(i32)));
         const n = ws2.recv(h, buf.ptr, len, 0);
         if (n == ws2.SOCKET_ERROR) return switch (ws2.WSAGetLastError()) {
-            .WSAETIMEDOUT => error.Timeout,
+            .WSAETIMEDOUT, .WSAEWOULDBLOCK => error.Timeout,
             .WSAECONNRESET, .WSAECONNABORTED, .WSAESHUTDOWN => error.ConnectionReset,
             else => error.RecvFailed,
         };
@@ -316,7 +318,7 @@ pub fn recvFrom(h: Handle, buf: []u8) RecvError!struct { usize, std.net.Address 
         const len: i32 = @intCast(@min(buf.len, std.math.maxInt(i32)));
         const n = ws2.recvfrom(h, buf.ptr, len, 0, &addr.any, &wlen);
         if (n == ws2.SOCKET_ERROR) return switch (ws2.WSAGetLastError()) {
-            .WSAETIMEDOUT => error.Timeout,
+            .WSAETIMEDOUT, .WSAEWOULDBLOCK => error.Timeout,
             .WSAECONNRESET, .WSAEMSGSIZE => error.ConnectionReset,
             else => error.RecvFailed,
         };

@@ -29,6 +29,8 @@ pub const Interest = packed struct(u8) {
 };
 
 /// One readiness notification. `ctx` is the pointer passed to `add`.
+/// `readable`/`writable` are also set by a hang-up or error when the interest
+/// includes that direction; `hup` says one of those happened.
 pub const Event = struct {
     ctx: *anyopaque,
     readable: bool,
@@ -45,9 +47,12 @@ const Entry = struct {
 pub const Reactor = struct {
     gpa: Allocator,
     entries: std.ArrayList(Entry) = .empty,
+    /// The pollfd set `wait` builds: the wake socket, then every entry with a
+    /// non-empty interest.
     scratch: std.ArrayList(posix.pollfd) = .empty,
-    /// UDP loopback socket signalled by `wake`; always registered first in
-    /// `scratch` so the drain path is hot.
+    /// `entries` index of each `scratch` slot after the wake socket's.
+    polled: std.ArrayList(u32) = .empty,
+    /// UDP loopback socket signalled by `wake`; always first in `scratch`.
     wake_sock: sock.Handle,
     wake_addr: std.net.Address,
 
@@ -63,6 +68,7 @@ pub const Reactor = struct {
         sock.close(self.wake_sock);
         self.entries.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
+        self.polled.deinit(self.gpa);
     }
 
     /// Registers `h` for `interest`. `ctx` is handed back on every readiness
@@ -86,34 +92,46 @@ pub const Reactor = struct {
     /// Waits up to `timeout_ms` (-1 to block indefinitely, 0 to poll). Fills
     /// `out` with readiness events, returns how many. If `wake` was called,
     /// the drain is silent and does not take a slot in `out`.
+    ///
+    /// Only handles with a non-empty interest are polled: poll() reports
+    /// hang-ups and errors even for an empty event mask, and with nobody
+    /// acting on them `wait` would return at once forever. A hang-up or error
+    /// is reported as readable and/or writable, per the interest, so the
+    /// recv/send the owner makes next returns the EOF or error and clears it.
     pub fn wait(self: *Reactor, out: []Event, timeout_ms: i32) !usize {
-        try self.scratch.resize(self.gpa, self.entries.items.len + 1);
+        self.scratch.clearRetainingCapacity();
+        self.polled.clearRetainingCapacity();
+        try self.scratch.ensureTotalCapacity(self.gpa, self.entries.items.len + 1);
+        try self.polled.ensureTotalCapacity(self.gpa, self.entries.items.len);
+        self.scratch.appendAssumeCapacity(.{ .fd = self.wake_sock, .events = posix.POLL.IN, .revents = 0 });
         for (self.entries.items, 0..) |e, i| {
+            if (!e.interest.read and !e.interest.write) continue;
             var events: i16 = 0;
             if (e.interest.read) events |= posix.POLL.IN;
             if (e.interest.write) events |= posix.POLL.OUT;
-            self.scratch.items[i] = .{ .fd = e.handle, .events = events, .revents = 0 };
+            self.scratch.appendAssumeCapacity(.{ .fd = e.handle, .events = events, .revents = 0 });
+            self.polled.appendAssumeCapacity(@intCast(i));
         }
-        const wake_i = self.entries.items.len;
-        self.scratch.items[wake_i] = .{ .fd = self.wake_sock, .events = posix.POLL.IN, .revents = 0 };
 
-        const n = posix.poll(self.scratch.items, timeout_ms) catch |err| return err;
+        const n = try posix.poll(self.scratch.items, timeout_ms);
         if (n == 0) return 0;
+        if (self.scratch.items[0].revents & posix.POLL.IN != 0) self.drainWake();
 
         var out_i: usize = 0;
-        for (self.entries.items, 0..) |e, i| {
+        for (self.scratch.items[1..], self.polled.items) |pfd, idx| {
             if (out_i == out.len) break;
-            const r = self.scratch.items[i].revents;
+            const r = pfd.revents;
             if (r == 0) continue;
+            const e = self.entries.items[idx];
+            const failed = r & (posix.POLL.HUP | posix.POLL.ERR) != 0;
             out[out_i] = .{
                 .ctx = e.ctx,
-                .readable = r & posix.POLL.IN != 0,
-                .writable = r & posix.POLL.OUT != 0,
-                .hup = r & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0,
+                .readable = e.interest.read and (failed or r & posix.POLL.IN != 0),
+                .writable = e.interest.write and (failed or r & posix.POLL.OUT != 0),
+                .hup = failed or r & posix.POLL.NVAL != 0,
             };
             out_i += 1;
         }
-        if (self.scratch.items[wake_i].revents & posix.POLL.IN != 0) self.drainWake();
         return out_i;
     }
 
@@ -203,4 +221,47 @@ test "add rejects duplicate registration; remove unregisters" {
     try r.add(h, @ptrCast(&dummy), .{ .read = true, .write = true });
     try testing.expectEqual(@as(usize, 1), r.count());
     r.remove(h);
+}
+
+/// Closes `h` so that its peer sees a reset instead of an orderly close.
+fn closeWithReset(h: sock.Handle) void {
+    if (builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const Linger = extern struct { onoff: u16, linger: u16 };
+        const l: Linger = .{ .onoff = 1, .linger = 0 };
+        _ = ws2.setsockopt(h, ws2.SOL.SOCKET, ws2.SO.LINGER, std.mem.asBytes(&l), @sizeOf(Linger));
+    } else {
+        const Linger = extern struct { onoff: c_int, linger: c_int };
+        const l: Linger = .{ .onoff = 1, .linger = 0 };
+        posix.setsockopt(h, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&l)) catch {};
+    }
+    sock.close(h);
+}
+
+test "a reset socket wakes wait only while someone is interested in it" {
+    const gpa = testing.allocator;
+    var r = try Reactor.init(gpa);
+    defer r.deinit();
+
+    var listener = try sock.listenTcp(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0), 1);
+    defer listener.deinit();
+    const client = try sock.tcpConnect(listener.listen_address, 1000);
+    const conn = try listener.accept();
+    defer conn.stream.close();
+    closeWithReset(client);
+
+    try sock.setNonblocking(conn.stream.handle);
+    var dummy: usize = 0;
+    try r.add(conn.stream.handle, @ptrCast(&dummy), .{});
+    var events: [2]Event = undefined;
+    // poll() reports the reset even for an empty event mask; a socket nobody
+    // waits on must not be polled, or wait() never blocks again.
+    try testing.expectEqual(@as(usize, 0), try r.wait(&events, 100));
+
+    // With read interest the reset is reported as readable, so the owner's
+    // next recv returns it.
+    try r.modify(conn.stream.handle, .{ .read = true });
+    try testing.expectEqual(@as(usize, 1), try r.wait(&events, 1000));
+    try testing.expect(events[0].readable);
+    try testing.expect(!events[0].writable);
 }
